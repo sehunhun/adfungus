@@ -47,6 +47,12 @@ def build_ads_library_url(page_id: str) -> str:
     )
 
 
+def build_default_output_path(page_id: str) -> str:
+    normalized_page_id = re.sub(r"[^0-9A-Za-z_-]+", "", _clean(page_id)) or "unknown"
+    timestamp = datetime.now().strftime("%m%d%H%M")
+    return f"result-{normalized_page_id}-{timestamp}.json"
+
+
 def _card_count_from_html(html: str) -> int:
     if not html:
         return 0
@@ -688,6 +694,7 @@ def main() -> None:
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--dump-html", default="")
     parser.add_argument("--output", default="")
+    parser.add_argument("--no-output", action="store_true")
     args = parser.parse_args()
 
     _setup_logging(args.debug)
@@ -717,10 +724,11 @@ def main() -> None:
     }
 
     text = json.dumps(payload, ensure_ascii=False, indent=2)
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as fp:
+    output_path = "" if args.no_output else (args.output or build_default_output_path(args.page_id))
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as fp:
             fp.write(text)
-        print(f"Saved: {args.output} ({len(items)} ads)")
+        print(f"Saved: {output_path} ({len(items)} ads)")
         return
 
     print(text)
