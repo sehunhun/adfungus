@@ -14,14 +14,17 @@ from urllib.parse import parse_qs, urlparse, unquote
 from scrapling.fetchers import AsyncStealthySession, StealthyFetcher
 from scrapling.parser import Selector
 
-
-DEFAULT_PAGE_ID = "654845641046548"
+DEFAULT_PAGE_ID = "654845641046548"  # 946841158506716
 LOGGER = logging.getLogger("meta-ads-crawler")
 AD_LIST_CONTAINER_SELECTOR = (
     "div.xrvj5dj.x18m771g.x1p5oq8j.xp48ta0.x18d9i69.xtssl2i.xtqikln"
     ".x1na6gtj.xjewof7.x1l48g3s.x1vql8b3.x1m5622i"
 )
 AD_CARD_SELECTOR = f"{AD_LIST_CONTAINER_SELECTOR} div.xh8yej3"
+SUMMARY_DETAIL_TEXT_RE = re.compile(
+    r"(요약\s*세부\s*사항\s*보기|See\s+summary\s+details)",
+    flags=re.IGNORECASE,
+)
 
 
 def _setup_logging(debug: bool) -> None:
@@ -170,7 +173,9 @@ def _collect_media(card: Any) -> Dict[str, Any]:
         src = _clean((getattr(img, "attrib", {}) or {}).get("src", ""))
         if not src:
             continue
-        if re.search(r"(?:_s60x60|s60x60|profile|t51\.82787-19)", src, flags=re.IGNORECASE):
+        if re.search(
+            r"(?:_s60x60|s60x60|profile|t51\.82787-19)", src, flags=re.IGNORECASE
+        ):
             continue
         images.append({"url": src})
 
@@ -232,7 +237,9 @@ def _extract_cta_text(value: str) -> str:
 
 
 def _extract_link_title_from_text(value: str) -> str:
-    match = re.search(r"\b([A-Z0-9][A-Z0-9.-]+\.[A-Z]{2,})\b", value, flags=re.IGNORECASE)
+    match = re.search(
+        r"\b([A-Z0-9][A-Z0-9.-]+\.[A-Z]{2,})\b", value, flags=re.IGNORECASE
+    )
     return match.group(1).upper() if match else ""
 
 
@@ -251,7 +258,11 @@ def _extract_link_description_from_text(card_text: str, link_title: str) -> str:
     tail = _clean(tail)
     if not tail:
         return ""
-    if re.search(r"(Library ID|Started running|Platforms|Open Dropdown|See ad details|Sponsored)", tail, flags=re.IGNORECASE):
+    if re.search(
+        r"(Library ID|Started running|Platforms|Open Dropdown|See ad details|Sponsored)",
+        tail,
+        flags=re.IGNORECASE,
+    ):
         return ""
     return tail[:180]
 
@@ -266,7 +277,9 @@ def _parse_cta_and_link(card: Any) -> Dict[str, str]:
 
     anchors = card.css("a[href]")
     for anchor in anchors:
-        href = _normalize_outbound_url((getattr(anchor, "attrib", {}) or {}).get("href", ""))
+        href = _normalize_outbound_url(
+            (getattr(anchor, "attrib", {}) or {}).get("href", "")
+        )
         text = _node_text(anchor)
         if not href:
             continue
@@ -300,8 +313,16 @@ def _parse_cta_and_link(card: Any) -> Dict[str, str]:
             continue
         if not link_title and re.fullmatch(r"[A-Z0-9.-]+\.[A-Z]{2,}", text):
             link_title = text
-        if not link_description and 8 <= len(text) <= 180 and text not in {cta_text, link_title}:
-            if not re.search(r"(라이브러리 ID|Library ID|게재 시작|Started running|플랫폼|Platforms|광고 상세 정보 보기|See ad details|Open Dropdown)", text, flags=re.IGNORECASE):
+        if (
+            not link_description
+            and 8 <= len(text) <= 180
+            and text not in {cta_text, link_title}
+        ):
+            if not re.search(
+                r"(라이브러리 ID|Library ID|게재 시작|Started running|플랫폼|Platforms|광고 상세 정보 보기|See ad details|Open Dropdown)",
+                text,
+                flags=re.IGNORECASE,
+            ):
                 link_description = text
                 break
 
@@ -345,7 +366,9 @@ def _parse_body_text(card: Any) -> str:
     text = unescape(_node_text(card))
     parts = re.split(r"\bSponsored\b|광고", text, maxsplit=1, flags=re.IGNORECASE)
     body = parts[1] if len(parts) > 1 else text
-    body = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\s*/\s*\d{1,2}:\d{2}(?::\d{2})?\b", " ", body)
+    body = re.sub(
+        r"\b\d{1,2}:\d{2}(?::\d{2})?\s*/\s*\d{1,2}:\d{2}(?::\d{2})?\b", " ", body
+    )
     link_title = _extract_link_title_from_text(body)
     if link_title:
         body = body.split(link_title, 1)[0]
@@ -419,7 +442,9 @@ def parse_ad_card(card: Any) -> Optional[Dict[str, Any]]:
     brand_data = _parse_brand(card)
     body = _parse_body_text(card)
 
-    active = "활성" in card_text or bool(re.search(r"\bActive\b", card_text, flags=re.IGNORECASE))
+    active = "활성" in card_text or bool(
+        re.search(r"\bActive\b", card_text, flags=re.IGNORECASE)
+    )
     start_date = _parse_start_date(card_text)
     platforms = _infer_platforms(card_text)
     ad_format = _detect_format(media["images"], media["videos"])
@@ -440,7 +465,61 @@ def parse_ad_card(card: Any) -> Optional[Dict[str, Any]]:
         "videos": media["videos"],
         "startDate": start_date,
         "format": ad_format,
+        "sameSourceLibraryIDs": [],
     }
+
+
+def _parse_ads_from_html(
+    html: str,
+    *,
+    debug: bool = False,
+    limit: int = 0,
+    context: str = "page",
+) -> List[Dict[str, Any]]:
+    if not html:
+        return []
+
+    doc = Selector(html)
+    raw_cards = doc.css(AD_CARD_SELECTOR)
+    card_candidates = _select_ad_card_candidates(doc, debug=debug)
+    if limit > 0:
+        card_candidates = card_candidates[:limit]
+
+    if debug:
+        LOGGER.debug("%s raw_cards(%s)=%s", context, AD_CARD_SELECTOR, len(raw_cards))
+        LOGGER.debug("%s selected_card_candidates=%s", context, len(card_candidates))
+
+    parsed: List[Dict[str, Any]] = []
+    seen_ids = set()
+    id_hits = 0
+
+    for idx, card in enumerate(card_candidates):
+        card_text = _node_text(card)
+        if LIBRARY_ID_RE.search(card_text):
+            id_hits += 1
+        if debug and idx < 3:
+            LOGGER.debug(
+                "%s card[%s] text_len=%s preview=%s",
+                context,
+                idx,
+                len(card_text),
+                card_text[:220],
+            )
+        item = parse_ad_card(card)
+        if not item:
+            continue
+        key = item.get("libraryID", "")
+        if not key or key in seen_ids:
+            continue
+        seen_ids.add(key)
+        parsed.append(item)
+
+    if debug:
+        LOGGER.debug("%s cards_with_library_id_regex=%s", context, id_hits)
+        LOGGER.debug("%s parsed_ads=%s", context, len(parsed))
+        LOGGER.debug("%s card_count_from_html=%s", context, _card_count_from_html(html))
+
+    return parsed
 
 
 async def _count_dom_matches(page: Any, selector: str) -> int:
@@ -455,40 +534,16 @@ async def _count_dom_matches(page: Any, selector: str) -> int:
 
 async def _count_library_ids_on_page(page: Any) -> int:
     try:
-        count = await page.evaluate(
-            r"""
+        count = await page.evaluate(r"""
             () => {
               const text = document.body ? document.body.innerText : '';
               const matches = text.match(/(?:라이브러리\s*ID|Library\s+ID|Ad\s+library\s+ID)\s*:\s*\d+/gi);
               return matches ? matches.length : 0;
             }
-            """
-        )
+            """)
         return int(count)
     except Exception:
         return -1
-
-
-async def _scroll_page(page: Any, rounds: int, wait_ms: int, debug: bool) -> None:
-    for idx in range(rounds):
-        try:
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        except Exception:
-            pass
-        try:
-            await page.wait_for_timeout(wait_ms)
-        except Exception:
-            await asyncio.sleep(wait_ms / 1000)
-
-        if debug:
-            xh8_count = await _count_dom_matches(page, AD_CARD_SELECTOR)
-            library_id_count = await _count_library_ids_on_page(page)
-            LOGGER.debug(
-                "scroll round=%s scoped_card_selector_count=%s library_id_text_count=%s",
-                idx + 1,
-                xh8_count,
-                library_id_count,
-            )
 
 
 async def _wait_until_stable_cards(
@@ -529,7 +584,11 @@ async def _wait_until_stable_cards(
               return current > 0 && state.hits >= stableRounds;
             }
             """,
-            arg={"selector": selector, "stableRounds": stable_rounds, "intervalMs": wait_ms},
+            arg={
+                "selector": selector,
+                "stableRounds": stable_rounds,
+                "intervalMs": wait_ms,
+            },
             timeout=timeout_ms,
             polling=wait_ms,
         )
@@ -595,14 +654,278 @@ async def _wait_until_stable_cards(
             await asyncio.sleep(wait_ms / 1000)
 
 
+async def _wait_until_min_library_ids(
+    page: Any,
+    *,
+    target_count: int,
+    max_rounds: int,
+    wait_ms: int,
+    debug: bool,
+) -> None:
+    for idx in range(max_rounds):
+        library_id_count = await _count_library_ids_on_page(page)
+        card_count = await _count_dom_matches(page, AD_CARD_SELECTOR)
+        if debug:
+            LOGGER.debug(
+                "target-load round=%s scoped_card_selector_count=%s library_id_text_count=%s target=%s",
+                idx + 1,
+                card_count,
+                library_id_count,
+                target_count,
+            )
+        if library_id_count >= target_count:
+            if debug:
+                LOGGER.debug(
+                    "target-load satisfied library_id_text_count=%s target=%s",
+                    library_id_count,
+                    target_count,
+                )
+            return
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(wait_ms)
+        except Exception:
+            await asyncio.sleep(wait_ms / 1000)
+
+
+async def _mark_top_ad_cards(page: Any, *, limit: int, debug: bool) -> List[str]:
+    try:
+        ids = await page.evaluate(
+            r"""
+            ({ selector, limit }) => {
+              const idRegex = /(?:라이브러리\s*ID|Library\s+ID|Ad\s+library\s+ID)\s*:\s*(\d+)/i;
+              document.querySelectorAll('[data-meta-ad-crawl-index]').forEach((el) => {
+                el.removeAttribute('data-meta-ad-crawl-index');
+              });
+
+              const byId = new Map();
+              document.querySelectorAll(selector).forEach((el) => {
+                const text = el.innerText || '';
+                const match = text.match(idRegex);
+                if (!match) return;
+                const id = match[1];
+                const current = byId.get(id);
+                if (!current || text.length > current.textLength) {
+                  byId.set(id, { el, textLength: text.length });
+                }
+              });
+
+              const ids = Array.from(byId.keys()).slice(0, limit > 0 ? limit : byId.size);
+              ids.forEach((id, index) => {
+                const item = byId.get(id);
+                if (item && item.el) {
+                  item.el.setAttribute('data-meta-ad-crawl-index', String(index));
+                }
+              });
+              return ids;
+            }
+            """,
+            {"selector": AD_CARD_SELECTOR, "limit": limit},
+        )
+        marked_ids = [str(value) for value in ids or []]
+        if debug:
+            LOGGER.debug("marked_top_ad_cards=%s ids=%s", len(marked_ids), marked_ids)
+        return marked_ids
+    except Exception as exc:
+        if debug:
+            LOGGER.debug("mark_top_ad_cards_failed error=%s", exc)
+        return []
+
+
+async def _close_active_dialog(page: Any) -> None:
+    close_selectors = [
+        '[aria-label="Close"]',
+        '[aria-label="닫기"]',
+        '[role="button"][aria-label="Close"]',
+        '[role="button"][aria-label="닫기"]',
+    ]
+    for selector in close_selectors:
+        try:
+            locator = page.locator(selector).last
+            if callable(locator):
+                locator = locator()
+            if await locator.count() > 0:
+                await locator.click(timeout=1500)
+                await page.wait_for_timeout(700)
+                return
+        except Exception:
+            pass
+    try:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(700)
+    except Exception:
+        pass
+
+
+async def _extract_dialog_html(page: Any) -> str:
+    selectors = ['div[role="dialog"]', '[aria-modal="true"]']
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).last
+            if callable(locator):
+                locator = locator()
+            if await locator.count() > 0:
+                html = await locator.inner_html(timeout=3000)
+                if html:
+                    return str(html)
+        except Exception:
+            pass
+    try:
+        content = await page.content()
+        return str(content or "")
+    except Exception:
+        return ""
+
+
+def _merge_same_source_groups(
+    main_items: List[Dict[str, Any]],
+    popup_groups: List[List[Dict[str, Any]]],
+    debug: bool,
+) -> List[Dict[str, Any]]:
+    by_id: Dict[str, Dict[str, Any]] = {}
+    same_source_by_id: Dict[str, set[str]] = {}
+
+    for item in main_items:
+        library_id = str(item.get("libraryID", "")).strip()
+        if not library_id:
+            continue
+        by_id[library_id] = item
+        same_source_by_id.setdefault(library_id, set()).update(
+            str(value) for value in item.get("sameSourceLibraryIDs", []) if value
+        )
+
+    for group_idx, group in enumerate(popup_groups):
+        group_ids = [str(item.get("libraryID", "")).strip() for item in group]
+        group_ids = [value for value in dict.fromkeys(group_ids) if value]
+        if debug:
+            LOGGER.debug("summary_group[%s] ids=%s", group_idx, group_ids)
+        if len(group_ids) < 2:
+            continue
+
+        for item in group:
+            library_id = str(item.get("libraryID", "")).strip()
+            if not library_id:
+                continue
+            if library_id not in by_id:
+                by_id[library_id] = item
+            same_source_by_id.setdefault(library_id, set()).update(
+                other_id for other_id in group_ids if other_id != library_id
+            )
+
+    merged: List[Dict[str, Any]] = []
+    emitted = set()
+    for item in main_items:
+        library_id = str(item.get("libraryID", "")).strip()
+        if not library_id or library_id in emitted:
+            continue
+        item["sameSourceLibraryIDs"] = sorted(same_source_by_id.get(library_id, set()))
+        merged.append(item)
+        emitted.add(library_id)
+
+    for library_id, item in by_id.items():
+        if library_id in emitted:
+            continue
+        item["sameSourceLibraryIDs"] = sorted(same_source_by_id.get(library_id, set()))
+        merged.append(item)
+        emitted.add(library_id)
+
+    if debug:
+        LOGGER.debug("same_source_groups=%s merged_ads=%s", len(popup_groups), len(merged))
+    return merged
+
+
+async def _collect_summary_popup_groups(
+    page: Any,
+    *,
+    debug: bool,
+    limit: int,
+    wait_ms: int,
+) -> List[List[Dict[str, Any]]]:
+    groups: List[List[Dict[str, Any]]] = []
+    seen_group_keys = set()
+    summary_texts = ["See summary details", "요약 세부 사항 보기"]
+    marked_ids = await _mark_top_ad_cards(page, limit=limit, debug=debug)
+    clicked = 0
+
+    for card_index, library_id in enumerate(marked_ids):
+        card = page.locator(f'[data-meta-ad-crawl-index="{card_index}"]')
+        button = None
+        matched_text = ""
+        for text in summary_texts:
+            try:
+                candidate = card.get_by_text(text, exact=False)
+                if int(await candidate.count()) > 0:
+                    button = candidate.nth(0)
+                    matched_text = text
+                    break
+            except Exception:
+                pass
+
+        if button is None:
+            if debug:
+                LOGGER.debug(
+                    "summary_button_not_found card_index=%s library_id=%s",
+                    card_index,
+                    library_id,
+                )
+            continue
+
+        try:
+            await button.scroll_into_view_if_needed(timeout=3000)
+            await button.click(timeout=5000)
+            await page.wait_for_timeout(wait_ms)
+        except Exception as exc:
+            if debug:
+                LOGGER.debug(
+                    "summary_click_failed card_index=%s library_id=%s text=%s error=%s",
+                    card_index,
+                    library_id,
+                    matched_text,
+                    exc,
+                )
+            continue
+
+        dialog_html = await _extract_dialog_html(page)
+        popup_items = _parse_ads_from_html(
+            dialog_html,
+            debug=debug,
+            limit=0,
+            context=f"summary_popup[{clicked}]",
+        )
+        if popup_items:
+            group_key = tuple(
+                sorted(
+                    str(item.get("libraryID", "")).strip()
+                    for item in popup_items
+                    if item.get("libraryID")
+                )
+            )
+            if group_key and group_key not in seen_group_keys:
+                seen_group_keys.add(group_key)
+                groups.append(popup_items)
+        if debug:
+            LOGGER.debug(
+                "summary_popup[%s] source_library_id=%s parsed_ads=%s ids=%s",
+                clicked,
+                library_id,
+                len(popup_items),
+                [item.get("libraryID") for item in popup_items],
+            )
+
+        clicked += 1
+        await _close_active_dialog(page)
+
+    return groups
+
+
 async def crawl_meta_ads(
     url: str,
-    scroll_rounds: int = 8,
     scroll_wait_ms: int = 1200,
     debug: bool = False,
     stable_rounds: int = 3,
     stable_max_rounds: int = 18,
     dump_html_path: str = "",
+    limit: int = 0,
 ) -> List[Dict[str, Any]]:
     StealthyFetcher.configure(adaptive=True)
 
@@ -617,26 +940,49 @@ async def crawl_meta_ads(
         LOGGER.debug("fetch url=%s", url)
         LOGGER.debug("session_config=%s", session_config)
 
+    popup_groups: List[List[Dict[str, Any]]] = []
+
     async with AsyncStealthySession(**session_config) as session:
+
         async def page_action(page: Any) -> None:
             await page.wait_for_timeout(3000)
-            await _scroll_page(page, rounds=scroll_rounds, wait_ms=scroll_wait_ms, debug=debug)
-            await _wait_until_stable_cards(
-                page,
-                selector=AD_CARD_SELECTOR,
-                stable_rounds=stable_rounds,
-                max_rounds=stable_max_rounds,
-                wait_ms=scroll_wait_ms,
-                debug=debug,
+            if limit > 0:
+                await _wait_until_min_library_ids(
+                    page,
+                    target_count=limit,
+                    max_rounds=stable_max_rounds,
+                    wait_ms=scroll_wait_ms,
+                    debug=debug,
+                )
+            else:
+                await _wait_until_stable_cards(
+                    page,
+                    selector=AD_CARD_SELECTOR,
+                    stable_rounds=stable_rounds,
+                    max_rounds=stable_max_rounds,
+                    wait_ms=scroll_wait_ms,
+                    debug=debug,
+                )
+            popup_groups.extend(
+                await _collect_summary_popup_groups(
+                    page,
+                    debug=debug,
+                    limit=limit,
+                    wait_ms=scroll_wait_ms,
+                )
             )
             await page.wait_for_timeout(1500)
 
-        result = await session.fetch(url, page_action=page_action, timeout=120000, network_idle=True)
+        result = await session.fetch(
+            url, page_action=page_action, timeout=120000, network_idle=True
+        )
 
     html = _extract_html(result)
     if debug:
         LOGGER.debug("html_length=%s", len(html))
-        LOGGER.debug("library_id_regex_matches_in_html=%s", _library_id_count_from_html(html))
+        LOGGER.debug(
+            "library_id_regex_matches_in_html=%s", _library_id_count_from_html(html)
+        )
     if not html:
         return []
 
@@ -645,49 +991,15 @@ async def crawl_meta_ads(
             fp.write(html)
         LOGGER.info("saved html dump: %s", dump_html_path)
 
-    doc = Selector(html)
-    raw_cards = doc.css(AD_CARD_SELECTOR)
-    card_candidates = _select_ad_card_candidates(doc, debug=debug)
-    if debug:
-        LOGGER.debug("raw_cards(%s)=%s", AD_CARD_SELECTOR, len(raw_cards))
-        LOGGER.debug("selected_card_candidates=%s", len(card_candidates))
-
-    parsed: List[Dict[str, Any]] = []
-    seen_ids = set()
-    id_hits = 0
-
-    for idx, card in enumerate(card_candidates):
-        card_text = _node_text(card)
-        if LIBRARY_ID_RE.search(card_text):
-            id_hits += 1
-        if debug and idx < 3:
-            LOGGER.debug(
-                "card[%s] text_len=%s preview=%s",
-                idx,
-                len(card_text),
-                card_text[:220],
-            )
-        item = parse_ad_card(card)
-        if not item:
-            continue
-        key = item.get("libraryID", "")
-        if not key or key in seen_ids:
-            continue
-        seen_ids.add(key)
-        parsed.append(item)
-
-    if debug:
-        LOGGER.debug("cards_with_library_id_regex=%s", id_hits)
-        LOGGER.debug("parsed_ads=%s", len(parsed))
-        LOGGER.debug("card_count_from_html=%s", _card_count_from_html(html))
-
-    return parsed
+    parsed = _parse_ads_from_html(html, debug=debug, limit=limit, context="page")
+    return _merge_same_source_groups(parsed, popup_groups, debug=debug)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Meta Ads Library crawler with scrapling")
+    parser = argparse.ArgumentParser(
+        description="Meta Ads Library crawler with scrapling"
+    )
     parser.add_argument("--page_id", default=DEFAULT_PAGE_ID)
-    parser.add_argument("--scroll-rounds", type=int, default=8)
     parser.add_argument("--scroll-wait-ms", type=int, default=1200)
     parser.add_argument("--stable-rounds", type=int, default=3)
     parser.add_argument("--stable-max-rounds", type=int, default=18)
@@ -695,6 +1007,7 @@ def main() -> None:
     parser.add_argument("--dump-html", default="")
     parser.add_argument("--output", default="")
     parser.add_argument("--no-output", action="store_true")
+    parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args()
 
     _setup_logging(args.debug)
@@ -707,12 +1020,12 @@ def main() -> None:
     items = asyncio.run(
         crawl_meta_ads(
             url=url,
-            scroll_rounds=max(args.scroll_rounds, 1),
             scroll_wait_ms=max(args.scroll_wait_ms, 300),
             debug=args.debug,
             stable_rounds=max(args.stable_rounds, 1),
             stable_max_rounds=max(args.stable_max_rounds, 1),
             dump_html_path=args.dump_html,
+            limit=max(args.limit, 0),
         )
     )
 
@@ -724,7 +1037,11 @@ def main() -> None:
     }
 
     text = json.dumps(payload, ensure_ascii=False, indent=2)
-    output_path = "" if args.no_output else (args.output or build_default_output_path(args.page_id))
+    output_path = (
+        ""
+        if args.no_output
+        else (args.output or build_default_output_path(args.page_id))
+    )
     if output_path:
         with open(output_path, "w", encoding="utf-8") as fp:
             fp.write(text)
