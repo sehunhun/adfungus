@@ -4,12 +4,14 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
+import time
 from datetime import datetime
 from html import unescape
 from typing import Any, Dict, List, Optional
-from urllib.parse import parse_qs, urlparse, unquote
+from urllib.parse import parse_qs, quote, urlparse, unquote
 
 from scrapling.fetchers import AsyncStealthySession, StealthyFetcher
 from scrapling.parser import Selector
@@ -50,6 +52,18 @@ def build_ads_library_url(page_id: str) -> str:
     )
 
 
+def build_ads_library_search_url(query: str, country: str = "KR") -> str:
+    normalized_country = re.sub(r"[^A-Za-z]", "", _clean(country)).upper() or "KR"
+    return (
+        "https://www.facebook.com/ads/library/?active_status=active&ad_type=all"
+        f"&country={normalized_country}&q={quote(_clean(query))}"
+    )
+
+
+def build_ads_library_detail_url(library_id: str) -> str:
+    return f"https://www.facebook.com/ads/library/?id={quote(_clean(library_id))}"
+
+
 def build_default_output_path(page_id: str) -> str:
     normalized_page_id = re.sub(r"[^0-9A-Za-z_-]+", "", _clean(page_id)) or "unknown"
     timestamp = datetime.now().strftime("%m%d%H%M")
@@ -80,6 +94,18 @@ def _clean(value: Any) -> str:
         return ""
     text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", str(value))
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_brand_key(value: str) -> str:
+    return re.sub(r"[^0-9a-z가-힣]+", "", _clean(value).lower())
+
+
+def _normalize_logo_key(value: str) -> str:
+    raw = _clean(value)
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    return f"{parsed.netloc.lower()}{parsed.path}"
 
 
 def _node_text(node: Any) -> str:
@@ -555,100 +581,85 @@ async def _wait_until_stable_cards(
     wait_ms: int,
     debug: bool,
 ) -> None:
-    timeout_ms = max_rounds * wait_ms
-    try:
-        await page.wait_for_function(
-            r"""
-            ({ selector, stableRounds, intervalMs }) => {
-              window.__metaAdsStableState = window.__metaAdsStableState || {};
-              const key = `${selector}:library-id`;
-              const state = window.__metaAdsStableState[key] || { last: -1, hits: 0, lastTs: 0 };
-              const now = Date.now();
-              if (now - state.lastTs < intervalMs) {
-                window.__metaAdsStableState[key] = state;
-                return false;
-              }
-
-              window.scrollTo(0, document.body.scrollHeight);
-              const text = document.body ? document.body.innerText : '';
-              const matches = text.match(/(?:라이브러리\s*ID|Library\s+ID|Ad\s+library\s+ID)\s*:\s*\d+/gi);
-              const current = matches ? matches.length : 0;
-              if (current === state.last) {
-                state.hits += 1;
-              } else {
-                state.hits = 0;
-              }
-              state.last = current;
-              state.lastTs = now;
-              window.__metaAdsStableState[key] = state;
-              return current > 0 && state.hits >= stableRounds;
-            }
-            """,
-            arg={
-                "selector": selector,
-                "stableRounds": stable_rounds,
-                "intervalMs": wait_ms,
-            },
-            timeout=timeout_ms,
-            polling=wait_ms,
-        )
-        if debug:
-            count = await _count_dom_matches(page, selector)
-            library_id_count = await _count_library_ids_on_page(page)
-            LOGGER.debug(
-                "wait_for_function library-id stable satisfied selector=%s count=%s library_id_text_count=%s",
-                selector,
-                count,
-                library_id_count,
-            )
-        return
-    except Exception as exc:
-        if debug:
-            LOGGER.debug("wait_for_function stable fallback reason=%s", exc)
-
-    stable_hits = 0
-    prev_count = -1
+    idle_rounds = 0
+    prev_library_id_count = -1
+    prev_scroll_height = -1
 
     for idx in range(max_rounds):
         try:
-            count = await page.evaluate(
-                "(sel) => document.querySelectorAll(sel).length", selector
+            metrics = await page.evaluate(
+                r"""
+                (sel) => {
+                  window.scrollTo(0, document.body.scrollHeight);
+                  const text = document.body ? document.body.innerText : '';
+                  const matches = text.match(/(?:라이브러리\s*ID|Library\s+ID|Ad\s+library\s+ID)\s*:\s*\d+/gi);
+                  const scrollHeight = document.body ? document.body.scrollHeight : 0;
+                  const bottomReached = window.scrollY + window.innerHeight >= scrollHeight - 8;
+                  return {
+                    count: document.querySelectorAll(sel).length,
+                    libraryIdCount: matches ? matches.length : 0,
+                    scrollHeight,
+                    scrollY: window.scrollY,
+                    innerHeight: window.innerHeight,
+                    bottomReached,
+                  };
+                }
+                """,
+                selector,
             )
         except Exception:
-            count = -1
+            metrics = {
+                "count": -1,
+                "libraryIdCount": -1,
+                "scrollHeight": -1,
+                "scrollY": -1,
+                "innerHeight": -1,
+                "bottomReached": False,
+            }
 
-        library_id_count = await _count_library_ids_on_page(page)
-        stable_count = library_id_count if library_id_count >= 0 else count
+        count = int(metrics.get("count", -1))
+        library_id_count = int(metrics.get("libraryIdCount", -1))
+        scroll_height = int(metrics.get("scrollHeight", -1))
+        scroll_y = int(metrics.get("scrollY", -1))
+        inner_height = int(metrics.get("innerHeight", -1))
+        bottom_reached = bool(metrics.get("bottomReached"))
 
-        if stable_count == prev_count and stable_count >= 0:
-            stable_hits += 1
+        height_stable = scroll_height == prev_scroll_height and scroll_height >= 0
+        ids_stable = library_id_count == prev_library_id_count and library_id_count > 0
+        if height_stable and ids_stable and bottom_reached:
+            idle_rounds += 1
         else:
-            stable_hits = 0
+            idle_rounds = 0
 
         if debug:
             LOGGER.debug(
-                "stable-fallback round=%s selector=%s count=%s library_id_text_count=%s stable_hits=%s/%s",
+                "stable-scroll round=%s selector=%s count=%s library_id_text_count=%s scroll_height=%s scroll_y=%s inner_height=%s bottom_reached=%s idle_rounds=%s/%s",
                 idx + 1,
                 selector,
                 count,
                 library_id_count,
-                stable_hits,
+                scroll_height,
+                scroll_y,
+                inner_height,
+                bottom_reached,
+                idle_rounds,
                 stable_rounds,
             )
 
-        if stable_hits >= stable_rounds:
+        if idle_rounds >= stable_rounds:
             if debug:
                 LOGGER.debug(
-                    "stable-check satisfied at round=%s count=%s library_id_text_count=%s",
+                    "stable-scroll satisfied at round=%s count=%s library_id_text_count=%s scroll_height=%s",
                     idx + 1,
                     count,
                     library_id_count,
+                    scroll_height,
                 )
             return
 
-        prev_count = stable_count
+        prev_library_id_count = library_id_count
+        prev_scroll_height = scroll_height
         try:
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(wait_ms)
         except Exception:
             await asyncio.sleep(wait_ms / 1000)
@@ -775,6 +786,190 @@ async def _extract_dialog_html(page: Any) -> str:
         return str(content or "")
     except Exception:
         return ""
+
+
+async def _extract_page_text(page: Any) -> str:
+    for selector in ['div[role="dialog"]', '[aria-modal="true"]', "body"]:
+        try:
+            locator = page.locator(selector).last if selector != "body" else page.locator(selector)
+            if callable(locator):
+                locator = locator()
+            if await locator.count() > 0:
+                text = await locator.inner_text(timeout=3000)
+                if text:
+                    return _clean(text)
+        except Exception:
+            pass
+    try:
+        return _clean(await page.content())
+    except Exception:
+        return ""
+
+
+async def _click_first_text(page: Any, texts: List[str], *, timeout: int = 3500) -> bool:
+    for text in texts:
+        try:
+            locator = page.get_by_text(text, exact=False)
+            if int(await locator.count()) > 0:
+                await locator.nth(0).scroll_into_view_if_needed(timeout=timeout)
+                await locator.nth(0).click(timeout=timeout)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _parse_advertiser_info_text(text: str) -> Dict[str, str]:
+    cleaned = _clean(text)
+    page_id_match = re.search(r"\bID\s*:\s*(\d{6,})", cleaned)
+
+    handle_match = re.search(r"@[A-Za-z0-9._]+", cleaned)
+    follower_matches = list(
+        re.finditer(
+            r"(?:팔로워\s*([0-9,.]+\s*(?:천|만|억)?\s*명?)|([0-9,.]+\s*[KMB]?)\s+followers)",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    followers = [_clean(match.group(1) or match.group(2)) for match in follower_matches]
+    handle_index = handle_match.start() if handle_match else -1
+    instagram_followers = ""
+    if handle_index >= 0:
+        for match in follower_matches:
+            if match.start() > handle_index:
+                instagram_followers = _clean(match.group(1) or match.group(2))
+                break
+
+    return {
+        "page_id": page_id_match.group(1) if page_id_match else "",
+        "facebook_followers_text": followers[0] if followers else "",
+        "instagram_handle": handle_match.group(0) if handle_match else "",
+        "instagram_followers_text": instagram_followers,
+    }
+
+
+def _group_advertiser_candidates(ads: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for ad in ads:
+        brand = _clean(ad.get("brand"))
+        brand_logo = _clean(ad.get("brandLogo"))
+        library_id = _clean(ad.get("libraryID"))
+        if not brand or not library_id:
+            continue
+        key = _normalize_brand_key(brand)
+        if key not in grouped:
+            grouped[key] = {
+                "brand": brand,
+                "brand_logo_url": brand_logo,
+                "representative_library_id": library_id,
+                "library_ids": [],
+                "matched_ads_count": 0,
+            }
+        grouped[key]["matched_ads_count"] += 1
+        grouped[key]["library_ids"].append(library_id)
+
+    candidates = sorted(
+        grouped.values(),
+        key=lambda item: item["matched_ads_count"],
+        reverse=True,
+    )
+    return candidates[:limit] if limit > 0 else candidates
+
+
+async def _fetch_advertiser_detail(
+    candidate: Dict[str, Any],
+    *,
+    debug: bool,
+) -> Dict[str, Any] | None:
+    async with AsyncStealthySession(
+        headless=True,
+        real_chrome=os.getenv("META_ADS_REAL_CHROME", "true").lower()
+        not in {"0", "false", "no"},
+        timeout=120000,
+        max_pages=1,
+    ) as session:
+        return await _fetch_advertiser_detail_with_session(
+            session,
+            candidate,
+            debug=debug,
+        )
+
+
+async def _fetch_advertiser_detail_with_session(
+    session: Any,
+    candidate: Dict[str, Any],
+    *,
+    debug: bool,
+) -> Dict[str, Any] | None:
+    library_ids = [str(value) for value in candidate.get("library_ids", []) if value]
+    if not library_ids:
+        return None
+
+    for library_id in library_ids[:2]:
+        detail: Dict[str, str] = {}
+
+        async def page_action(page: Any) -> None:
+            nonlocal detail
+            for _ in range(40):
+                try:
+                    current_url = str(getattr(page, "url", "") or "")
+                    page_id = parse_qs(urlparse(current_url).query).get("view_all_page_id", [""])[0]
+                    if page_id:
+                        detail["page_id"] = page_id
+                        return
+                except Exception:
+                    pass
+                await page.wait_for_timeout(100)
+
+        try:
+            await session.fetch(
+                build_ads_library_detail_url(library_id),
+                page_action=page_action,
+                timeout=30000,
+                network_idle=False,
+            )
+        except Exception as exc:
+            if debug:
+                LOGGER.debug(
+                    "advertiser_detail_fetch_failed library_id=%s error=%s",
+                    library_id,
+                    exc,
+                )
+            continue
+
+        if detail.get("page_id"):
+            merged = dict(candidate)
+            merged.update(detail)
+            merged["representative_library_id"] = library_id
+            merged["source"] = "meta_ads_library"
+            return merged
+
+    return None
+
+
+def _dedupe_advertiser_results(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_page_id: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        page_id = _clean(item.get("page_id"))
+        if not page_id:
+            continue
+        current = by_page_id.get(page_id)
+        if current is None:
+            by_page_id[page_id] = item
+            continue
+        current["matched_ads_count"] += int(item.get("matched_ads_count") or 0)
+        current["library_ids"] = sorted(
+            set(current.get("library_ids", [])) | set(item.get("library_ids", []))
+        )
+        if not current.get("instagram_handle") and item.get("instagram_handle"):
+            current["instagram_handle"] = item["instagram_handle"]
+            current["instagram_followers_text"] = item.get("instagram_followers_text", "")
+    return sorted(
+        by_page_id.values(),
+        key=lambda item: item.get("matched_ads_count", 0),
+        reverse=True,
+    )
 
 
 def _merge_same_source_groups(
@@ -926,19 +1121,20 @@ async def crawl_meta_ads(
     stable_max_rounds: int = 18,
     dump_html_path: str = "",
     limit: int = 0,
+    filter_page_id: Optional[str] = None,  # Backward-compatible no-op (q search keeps all results).
 ) -> List[Dict[str, Any]]:
     StealthyFetcher.configure(adaptive=True)
 
     session_config: Dict[str, Any] = {
         "headless": True,
-        "real_chrome": True,
+        "real_chrome": os.getenv("META_ADS_REAL_CHROME", "true").lower()
+        not in {"0", "false", "no"},
         "timeout": 120000,
         "max_pages": 1,
     }
 
     if debug:
-        LOGGER.debug("fetch url=%s", url)
-        LOGGER.debug("session_config=%s", session_config)
+        LOGGER.debug("fetch url=%s filter_page_id(no-op)=%s", url, filter_page_id)
 
     popup_groups: List[List[Dict[str, Any]]] = []
 
@@ -995,6 +1191,150 @@ async def crawl_meta_ads(
     return _merge_same_source_groups(parsed, popup_groups, debug=debug)
 
 
+async def search_meta_advertisers(
+    query: str,
+    *,
+    country: str = "KR",
+    limit: int = 10,
+    scroll_wait_ms: int = 1200,
+    debug: bool = False,
+    include_timings: bool = False,
+    **kwargs,  # Accept detail_concurrency for backward compatibility
+) -> List[Dict[str, Any]]:
+    timings: Dict[str, float] = {}
+    started = time.perf_counter()
+    StealthyFetcher.configure(adaptive=True)
+    url = build_ads_library_search_url(query, country=country)
+    if debug:
+        LOGGER.info(f"[Search] Starting search for query: '{query}' at URL: {url}")
+
+    results: List[Dict[str, Any]] = []
+
+    async with AsyncStealthySession(
+        headless=True,
+        real_chrome=os.getenv("META_ADS_REAL_CHROME", "true").lower()
+        not in {"0", "false", "no"},
+        timeout=120000,
+        max_pages=1,
+    ) as session:
+        if debug:
+            LOGGER.info("[Search] AsyncStealthySession started")
+
+        async def page_action(page: Any) -> None:
+            if debug:
+                LOGGER.info("[Search] Page action triggered, waiting for initial load...")
+            await page.wait_for_timeout(3000)
+            
+            # 0. 일반적인 방해 요소(쿠키 배너 등) 닫기 시도
+            try:
+                overlay_selectors = ['[aria-label="닫기"]', '[aria-label="Close"]', 'button:has-text("모두 허용")', 'button:has-text("Allow all cookies")']
+                for sel in overlay_selectors:
+                    overlay = page.locator(sel).first
+                    if await overlay.count() > 0:
+                        if debug: LOGGER.info(f"[Search] Closing overlay: {sel}")
+                        await overlay.click(timeout=2000)
+            except Exception:
+                pass
+
+            # 1. 검색창 클릭하여 팝업 활성화
+            if debug:
+                LOGGER.info("[Search] Looking for keyword/advertiser search input...")
+            
+            # 사용자가 제공한 HTML 구조 반영: type="search" 및 관련 placeholder 사용
+            search_input = page.locator('input[type="search"][placeholder*="검색"], input[type="search"][placeholder*="Search"]').first
+            
+            try:
+                if await search_input.count() > 0:
+                    if debug:
+                        LOGGER.info("[Search] Keyword search input found, clicking (forced)...")
+                    # scrollTo를 명시적으로 수행하여 가시성 확보 시도
+                    await search_input.scroll_into_view_if_needed()
+                    await search_input.click(force=True, timeout=5000)
+                    await page.wait_for_timeout(2000)
+                else:
+                    if debug:
+                        LOGGER.warning("[Search] Keyword search input NOT found. Retrying with fallback selector...")
+                    # 백업: 일반적인 input 태그 중 검색 관련
+                    search_input = page.locator('input[placeholder*="광고주"], input[placeholder*="advertiser"]').first
+                    if await search_input.count() > 0:
+                        await search_input.click(force=True)
+                        await page.wait_for_timeout(2000)
+            except Exception as e:
+                LOGGER.error(f"[Search] Error clicking search input: {e}")
+                # 클릭 실패 시 JavaScript로 직접 클릭 시도
+                try:
+                    if debug: LOGGER.info("[Search] Attempting JS click as fallback...")
+                    await page.evaluate('(el) => el.click()', await search_input.element_handle())
+                    await page.wait_for_timeout(2000)
+                except Exception as js_e:
+                    LOGGER.error(f"[Search] JS click also failed: {js_e}")
+            
+            # 2. 광고주 팝업 요소 파싱
+            if debug:
+                LOGGER.info("[Search] Looking for advertiser options (li[id^='pageID:'])...")
+            advertiser_options = page.locator('li[id^="pageID:"]')
+            count = await advertiser_options.count()
+            
+            if debug:
+                LOGGER.info(f"[Search] Found {count} advertiser options in popup")
+                
+            for i in range(min(count, limit)):
+                option = advertiser_options.nth(i)
+                try:
+                    html = await option.inner_html()
+                    option_id = await option.get_attribute("id") or ""
+                    page_id = option_id.replace("pageID:", "").strip()
+                    
+                    doc = Selector(html)
+                    brand = _node_text(doc.css('[role="heading"]').first)
+                    logo_node = doc.css('img').first
+                    logo = ""
+                    if logo_node:
+                        logo = _clean(logo_node.attrib.get("src", ""))
+                    
+                    extra_text = _node_text(doc)
+                    info = _parse_advertiser_info_text(extra_text)
+                    
+                    if debug:
+                        LOGGER.info(f"[Search] Extracted brand: {brand} (Page ID: {page_id}), Logo: {logo[:30]}...")
+
+                    results.append({
+                        "page_id": page_id,
+                        "brand": brand or info.get("instagram_handle") or f"Page {page_id}",
+                        "brand_logo_url": logo,
+                        "facebook_followers_text": info.get("facebook_followers_text"),
+                        "instagram_handle": info.get("instagram_handle"),
+                        "instagram_followers_text": info.get("instagram_followers_text"),
+                        "source": "advertiser_popup",
+                        "matched_ads_count": 0 
+                    })
+                except Exception as e:
+                    LOGGER.error(f"[Search] Error extracting option {i}: {e}")
+
+        if debug:
+            LOGGER.info(f"[Search] Fetching URL: {url}")
+        try:
+            await session.fetch(
+                url,
+                page_action=page_action,
+                timeout=120000,
+                network_idle=True,
+                wait_selector='input[type="search"]',
+                wait_selector_state="visible",
+            )
+        except Exception as e:
+            LOGGER.error(f"[Search] Session fetch failed: {e}")
+
+    timings["total_seconds"] = round(time.perf_counter() - started, 2)
+    if debug:
+        LOGGER.info(f"[Search] Search completed in {timings['total_seconds']}s. Found {len(results)} results.")
+    
+    if include_timings and results:
+        results[0]["_timings"] = timings
+        
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Meta Ads Library crawler with scrapling"
@@ -1008,9 +1348,40 @@ def main() -> None:
     parser.add_argument("--output", default="")
     parser.add_argument("--no-output", action="store_true")
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--search-query", default="")
+    parser.add_argument("--search-country", default="KR")
+    parser.add_argument("--detail-concurrency", type=int, default=4)
     args = parser.parse_args()
 
     _setup_logging(args.debug)
+
+    if args.search_query:
+        started = datetime.now()
+        items = asyncio.run(
+            search_meta_advertisers(
+                args.search_query,
+                country=args.search_country,
+                limit=args.limit if args.limit > 0 else 30,
+                detail_concurrency=max(args.detail_concurrency, 1),
+                scroll_wait_ms=max(args.scroll_wait_ms, 300),
+                debug=args.debug,
+                include_timings=True,
+            )
+        )
+        timings = items[0].pop("_timings", {}) if items and "_timings" in items[0] else {}
+        for item in items:
+            item.pop("_timings", None)
+        payload = {
+            "ok": True,
+            "query": args.search_query,
+            "country": args.search_country,
+            "count": len(items),
+            "elapsed_seconds": round((datetime.now() - started).total_seconds(), 2),
+            "timings": timings,
+            "items": items,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
 
     url = build_ads_library_url(args.page_id)
     LOGGER.info("page_id=%s", _clean(args.page_id))

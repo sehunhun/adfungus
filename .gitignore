@@ -31,3 +31,7 @@ dump*.html
 Thumbs.db
 .vscode/
 .idea/
+
+# Stitch
+.stitch_*
+.vercel
