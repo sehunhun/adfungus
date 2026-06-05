@@ -598,14 +598,30 @@ def delete_folder(folder_id: int, request: Request) -> dict[str, Any]:
         ctx = _workspace_context(request, conn)
         _require_write_role(ctx)
         workspace_id = ctx["workspace_id"]
-        # Note: competitors table has folder_id REFERENCES folders(id) ON DELETE SET NULL
-        # So deleting a folder will automatically move its competitors to 'Unorganized'.
+        competitor_result = conn.execute(
+            """
+            WITH RECURSIVE folder_tree AS (
+                SELECT id
+                FROM folders
+                WHERE id = %s AND workspace_id = %s
+                UNION ALL
+                SELECT child.id
+                FROM folders child
+                JOIN folder_tree parent ON parent.id = child.parent_id
+                WHERE child.workspace_id = %s
+            )
+            DELETE FROM competitors
+            WHERE workspace_id = %s
+              AND folder_id IN (SELECT id FROM folder_tree)
+            """,
+            (folder_id, workspace_id, workspace_id, workspace_id),
+        )
         res = conn.execute(
             "DELETE FROM folders WHERE id = %s AND workspace_id = %s",
             (folder_id, workspace_id),
         )
         conn.commit()
-    return {"ok": True}
+    return {"ok": True, "deleted_competitors": competitor_result.rowcount}
 
 
 @app.post("/api/competitors")

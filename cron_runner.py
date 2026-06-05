@@ -497,60 +497,84 @@ def _iter_media(ad: Dict[str, Any]) -> Iterable[tuple[str, str, int | None, Dict
 
 def _prepare_media_for_storage(ads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     client = _r2_client()
-    prepared: List[Dict[str, Any]] = []
+    
+    # 1. Identify "Leaders" (the representative ad for each unique video/image source)
+    unique_media: Dict[str, Dict[str, Any]] = {}  # source_url -> {library_id, media_type}
+    
+    for ad in ads:
+        library_id = _library_id(ad)
+        if not library_id:
+            continue
+            
+        same_source = ad.get("sameSourceLibraryIDs") or []
+        # If same_source exists and it's a list of dicts, check if we are the first one
+        if same_source and isinstance(same_source[0], dict):
+            leader_id = same_source[0]["id"]
+            if library_id != leader_id:
+                # This is a follower. Skip its media processing; we will clone it later.
+                continue
+        
+        for collection_name, media_type in (("images", "image"), ("videos", "video")):
+            for m in ad.get(collection_name) or []:
+                url = str((m or {}).get("url") or "").strip()
+                if url and url not in unique_media:
+                    unique_media[url] = {"library_id": library_id, "media_type": media_type}
+        
+        logo_url = str(ad.get("brandLogo") or "").strip()
+        if logo_url and "fbcdn.net" in logo_url and logo_url not in unique_media:
+            unique_media[logo_url] = {"library_id": library_id, "media_type": "logo"}
 
+    # 2. Upload unique media from leaders in parallel
+    media_cache: Dict[str, Dict[str, Any]] = {}
+    if unique_media:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        concurrency = _int_env("MEDIA_UPLOAD_CONCURRENCY", 10)
+        LOGGER.info("Parallel media storage: uploading %s unique items with %s threads", len(unique_media), concurrency)
+        
+        def _worker_task(source_url: str, info: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+            try:
+                uploaded = _upload_media_to_r2(
+                    client,
+                    library_id=info["library_id"],
+                    media_type=info["media_type"],
+                    source_url=source_url,
+                )
+                return source_url, uploaded
+            except Exception as exc:
+                LOGGER.warning("media upload failed library_id=%s type=%s url=%s error=%s", 
+                               info["library_id"], info["media_type"], source_url, exc)
+                return source_url, None
+
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            future_to_url = {executor.submit(_worker_task, url, info): url for url, info in unique_media.items()}
+            for future in as_completed(future_to_url):
+                url, result = future.result()
+                if result:
+                    media_cache[url] = result
+
+    # 3. Update ads with R2 URLs (primarily leaders, followers are skipped here)
+    prepared: List[Dict[str, Any]] = []
     for ad in ads:
         library_id = _library_id(ad)
         if not library_id:
             prepared.append(ad)
             continue
-
+            
         copied = dict(ad)
         for collection_name, media_type in (("images", "image"), ("videos", "video")):
             items = []
-            for media in ad.get(collection_name) or []:
-                raw = dict(media or {})
+            for m in ad.get(collection_name) or []:
+                raw = dict(m or {})
                 source_url = str(raw.get("url") or "").strip()
-                if not source_url:
-                    continue
-                try:
-                    uploaded = _upload_media_to_r2(
-                        client,
-                        library_id=library_id,
-                        media_type=media_type,
-                        source_url=source_url,
-                    )
-                except Exception as exc:
-                    LOGGER.warning(
-                        "media upload failed library_id=%s type=%s url=%s error=%s",
-                        library_id,
-                        media_type,
-                        source_url,
-                        exc,
-                    )
-                    continue
-                raw.update(uploaded)
+                if source_url in media_cache:
+                    raw.update(media_cache[source_url])
                 items.append(raw)
             copied[collection_name] = items
-
-        # 브랜드 로고 이미지 업로드
+            
         logo_url = str(copied.get("brandLogo") or "").strip()
-        if logo_url and "fbcdn.net" in logo_url:
-            try:
-                uploaded = _upload_media_to_r2(
-                    client,
-                    library_id=library_id,
-                    media_type="logo",
-                    source_url=logo_url,
-                )
-                copied["brandLogo"] = uploaded["url"]
-            except Exception as exc:
-                LOGGER.warning(
-                    "logo upload failed library_id=%s url=%s error=%s",
-                    library_id,
-                    logo_url,
-                    exc,
-                )
+        if logo_url in media_cache:
+            copied["brandLogo"] = media_cache[logo_url]["url"]
+            
         prepared.append(copied)
 
     return prepared
@@ -670,11 +694,12 @@ def _store_ads(
     *,
     run_id: int,
     page_id: str,
+    ads: List[Dict[str, Any]],
     workspace_id: int | None = None,
     competitor_id: int | None = None,
-    ads: List[Dict[str, Any]],
 ) -> tuple[int, List[str]]:
-    LOGGER.info("storing %d ads for page_id=%s", len(ads), page_id)
+    from psycopg.types.json import Jsonb
+
     stored = 0
     stored_library_ids: List[str] = []
     with conn.cursor() as cur:
@@ -761,6 +786,36 @@ def _store_ads(
                 (run_id, library_id, ad.get("active"), Jsonb(ad)),
             )
 
+            for media_type, url, duration_seconds, raw in _iter_media(ad):
+                cur.execute(
+                    """
+                    INSERT INTO meta_ad_media (
+                        library_id, media_type, url, source_url, storage_key,
+                        content_type, byte_size, duration_seconds, raw_json
+                    )
+                    VALUES (%(library_id)s, %(media_type)s, %(url)s, %(source_url)s, %(storage_key)s,
+                            %(content_type)s, %(byte_size)s, %(duration_seconds)s, %(raw_json)s)
+                    ON CONFLICT (library_id, media_type, url) DO UPDATE SET
+                        source_url = EXCLUDED.source_url,
+                        storage_key = EXCLUDED.storage_key,
+                        content_type = EXCLUDED.content_type,
+                        byte_size = EXCLUDED.byte_size,
+                        duration_seconds = EXCLUDED.duration_seconds,
+                        raw_json = EXCLUDED.raw_json
+                    """,
+                    {
+                        "library_id": library_id,
+                        "media_type": media_type,
+                        "url": url,
+                        "source_url": raw.get("source_url"),
+                        "storage_key": raw.get("storage_key"),
+                        "content_type": raw.get("content_type"),
+                        "byte_size": raw.get("byte_size"),
+                        "duration_seconds": duration_seconds,
+                        "raw_json": Jsonb(raw),
+                    },
+                )
+
             stored += 1
             stored_library_ids.append(library_id)
 
@@ -783,48 +838,134 @@ def _store_ads(
                     (workspace_id, competitor_id, library_id, run_id, run_id),
                 )
 
-                # Update the master competitor record if we have a fresh R2 logo
-                logo_url = ad.get("brandLogo")
-                if logo_url and "r2.dev" in logo_url:
-                    cur.execute(
-                        "UPDATE competitors SET brand_logo_url = %s, updated_at = now() WHERE id = %s",
-                        (logo_url, competitor_id)
-                    )
-
-        for ad in ads:
-            library_id = _library_id(ad)
-            if not library_id:
-                continue
-            for media_type, url, duration_seconds, raw in _iter_media(ad):
-                # UPSERT: Replace CDN with R2 if available
-                cur.execute(
-                    """
-                    INSERT INTO meta_ad_media (
-                        library_id, media_type, url, source_url, storage_key,
-                        content_type, byte_size, duration_seconds, raw_json
-                    )
-                    VALUES (%(library_id)s, %(media_type)s, %(url)s, %(source_url)s, %(storage_key)s,
-                            %(content_type)s, %(byte_size)s, %(duration_seconds)s, %(raw_json)s)
-                    ON CONFLICT (library_id, media_type, source_url) WHERE source_url IS NOT NULL DO UPDATE SET
-                        url = CASE 
-                            WHEN meta_ad_media.url LIKE '%%fbcdn.net%%' AND EXCLUDED.url LIKE '%%r2.dev%%' THEN EXCLUDED.url 
-                            ELSE meta_ad_media.url 
-                        END
-                    """,
-                    {
-                        "library_id": library_id,
-                        "media_type": media_type,
-                        "url": url,
-                        "source_url": raw.get("source_url"),
-                        "storage_key": raw.get("storage_key"),
-                        "content_type": raw.get("content_type"),
-                        "byte_size": raw.get("byte_size"),
-                        "duration_seconds": duration_seconds,
-                        "raw_json": Jsonb(raw),
-                    },
-                )
-
     return stored, stored_library_ids
+
+
+def _expand_versions_globally(database_url: str) -> None:
+    """
+    Final step of the Lean Pipeline: Clones results from Leaders to Followers for all ads.
+    This creates rows for ad versions that were skipped during the main crawl.
+    """
+    LOGGER.info("--- Starting global version expansion (Fan-out) ---")
+    with psycopg.connect(database_url) as conn:
+        with conn.cursor() as cur:
+            # 1. Identify missing versions across all ads
+            cur.execute("""
+                WITH versions AS (
+                    SELECT 
+                        library_id as leader_id,
+                        jsonb_array_elements(same_source_library_ids) as ver
+                    FROM meta_ads
+                    WHERE jsonb_array_length(same_source_library_ids) > 0
+                ),
+                to_create AS (
+                    SELECT 
+                        leader_id,
+                        ver->>'id' as version_id,
+                        ver->>'startDate' as start_date_text
+                    FROM versions
+                    WHERE ver->>'id' IS NOT NULL AND ver->>'id' <> leader_id
+                )
+                SELECT DISTINCT ON (version_id) 
+                    leader_id, version_id, start_date_text
+                FROM to_create
+                WHERE NOT EXISTS (SELECT 1 FROM meta_ads WHERE library_id = version_id)
+            """)
+            missing = cur.fetchall()
+            
+            if not missing:
+                LOGGER.info("No missing versions to expand.")
+                return
+
+            LOGGER.info(f"Expanding {len(missing)} missing versions from leaders...")
+            
+            for leader_id, version_id, start_date_text in missing:
+                try:
+                    # Clone meta_ads row
+                    cur.execute("""
+                        INSERT INTO meta_ads (
+                            library_id, page_id, brand, brand_logo_url, active, platforms, body,
+                            link_title, link_url, link_description, cta_text, cta_url,
+                            start_date_text, start_date, ad_format, same_source_library_ids,
+                            meta_library_url, competitor_id, status, raw_json,
+                            first_seen_run_id, last_seen_run_id
+                        )
+                        SELECT 
+                            %s, page_id, brand, brand_logo_url, active, platforms, body,
+                            link_title, link_url, link_description, cta_text, cta_url,
+                            %s, NULL, ad_format, same_source_library_ids,
+                            NULL, competitor_id, status, raw_json,
+                            first_seen_run_id, last_seen_run_id
+                        FROM meta_ads WHERE library_id = %s
+                        ON CONFLICT (library_id) DO NOTHING
+                    """, (version_id, start_date_text, leader_id))
+                    
+                    # Clone meta_ad_media rows
+                    cur.execute("""
+                        INSERT INTO meta_ad_media (
+                            library_id, media_type, url, source_url, storage_key, 
+                            content_type, byte_size, duration_seconds, raw_json
+                        )
+                        SELECT 
+                            %s, media_type, url, source_url, storage_key, 
+                            content_type, byte_size, duration_seconds, raw_json
+                        FROM meta_ad_media WHERE library_id = %s
+                        ON CONFLICT DO NOTHING
+                    """, (version_id, leader_id))
+                    
+                    # Clone video extractions (if exist)
+                    cur.execute("""
+                        INSERT INTO meta_ad_video_extractions (
+                            media_id, library_id, model, prompt_version, status,
+                            audio_transcript, screen_text, section_types,
+                            hooking_audio, hooking_screen_text, hooking_visual_direction, hooking_categories,
+                            body_audio, body_screen_text, closing_audio, closing_screen_text, closing_cta,
+                            result_json, processed_at
+                        )
+                        SELECT 
+                            m_new.id, %s, e.model, e.prompt_version, e.status,
+                            e.audio_transcript, e.screen_text, e.section_types,
+                            e.hooking_audio, e.hooking_screen_text, e.hooking_visual_direction, e.hooking_categories,
+                            e.body_audio, e.body_screen_text, e.closing_audio, e.closing_screen_text, e.closing_cta,
+                            e.result_json, e.processed_at
+                        FROM meta_ad_video_extractions e
+                        JOIN meta_ad_media m_old ON m_old.id = e.media_id
+                        JOIN meta_ad_media m_new ON m_new.library_id = %s AND m_new.url = m_old.url
+                        WHERE e.library_id = %s
+                        ON CONFLICT (media_id) DO NOTHING
+                    """, (version_id, version_id, leader_id))
+                    
+                    # Clone embeddings (if exist)
+                    cur.execute("""
+                        INSERT INTO meta_ad_embeddings (
+                            library_id, embedding, similarity_sum, similarity_rank, 
+                            similarity_run_id, similar_count, similar_library_ids
+                        )
+                        SELECT 
+                            %s, embedding, similarity_sum, similarity_rank, 
+                            similarity_run_id, similar_count, similar_library_ids
+                        FROM meta_ad_embeddings WHERE library_id = %s
+                        ON CONFLICT (library_id) DO NOTHING
+                    """, (version_id, leader_id))
+
+                    # Clone workspace associations
+                    cur.execute("""
+                        INSERT INTO workspace_meta_ads (
+                            workspace_id, competitor_id, library_id, 
+                            first_seen_run_id, last_seen_run_id, status
+                        )
+                        SELECT 
+                            workspace_id, competitor_id, %s,
+                            first_seen_run_id, last_seen_run_id, status
+                        FROM workspace_meta_ads WHERE library_id = %s
+                        ON CONFLICT DO NOTHING
+                    """, (version_id, leader_id))
+
+                except Exception:
+                    LOGGER.exception(f"Failed to expand version {version_id} from leader {leader_id}")
+            
+            conn.commit()
+            LOGGER.info("Global version expansion completed.")
 
 
 def _mark_missing_ads(
@@ -1028,6 +1169,11 @@ def sync_competitor(competitor_id: int) -> int:
             _process_embeddings_after_crawl(database_url, new_library_ids)
         except Exception:
             LOGGER.exception("embedding generation failed for competitor_id=%s", competitor_id)
+
+        try:
+            _expand_versions_globally(database_url)
+        except Exception:
+            LOGGER.exception("global version expansion failed for competitor_id=%s", competitor_id)
     
     return stored
 
@@ -1074,6 +1220,7 @@ def main() -> int:
                 if new_library_ids:
                     _process_videos_after_crawl(database_url, new_library_ids)
                     _process_embeddings_after_crawl(database_url, new_library_ids)
+                    _expand_versions_globally(database_url)
                 return 0
             except Exception as exc:
                 conn.rollback()
@@ -1085,20 +1232,11 @@ def main() -> int:
         for target in competitors:
             stored_total += sync_competitor(target["id"])
             
-        # All competitors processed. Now perform a final global cleanup for any pending/failed videos
-        # that might have been missed due to rate limits or other transient errors during the brand loops.
-        LOGGER.info("--- Starting final global video extraction cleanup ---")
+        # FINAL STEP: Expand versions from leaders to followers globally
         try:
-            from video_text_worker import process_pending_videos
-            process_pending_videos(database_url=database_url, concurrency=int(os.getenv("VIDEO_CONCURRENCY", "10")))
+            _expand_versions_globally(database_url)
         except Exception:
-            LOGGER.exception("Final global video extraction failed")
-
-        LOGGER.info("--- Starting final global embedding and similarity cleanup ---")
-        try:
-            _process_embeddings_after_crawl(database_url)
-        except Exception:
-            LOGGER.exception("Final global embedding cleanup failed")
+            LOGGER.exception("Final global version expansion failed")
 
         return 0 if stored_total or competitors else 1
 

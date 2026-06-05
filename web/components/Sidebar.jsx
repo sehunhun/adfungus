@@ -14,6 +14,7 @@ export default function Sidebar({
   onUpdateMonitor,
   onMoveCompetitor,
   onDeleteCompetitor,
+  onDeleteCompetitors,
   selectedFilterBrands,
   onToggleFilterBrand,
   searchQuery,
@@ -23,6 +24,9 @@ export default function Sidebar({
   const [menuOpenId, setMenuOpenId] = useState(null);
   const [folderMenuOpenId, setFolderMenuOpenId] = useState(null);
   const [moveOpenId, setMoveOpenId] = useState(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteSelectedIds, setDeleteSelectedIds] = useState(new Set());
+  const [isDeleting, setIsDeleting] = useState(false);
   const [draggedFolderId, setDraggedFolderId] = useState(null);
 
   // Close menu when clicking outside
@@ -40,6 +44,46 @@ export default function Sidebar({
     competitors: competitors.filter(c => c.folder_id === folder.id)
   }));
   const unorganizedCompetitors = competitors.filter(c => !c.folder_id);
+  const deleteGroups = [
+    ...competitorsByFolder.filter(group => group.competitors.length > 0),
+    { id: 'unorganized', name: '미지정', competitors: unorganizedCompetitors }
+  ].filter(group => group.competitors.length > 0);
+
+  const openDeleteModal = (competitorId) => {
+    setDeleteSelectedIds(new Set([competitorId]));
+    setDeleteOpen(true);
+  };
+
+  const toggleDeleteSelection = (competitorId) => {
+    setDeleteSelectedIds(current => {
+      const next = new Set(current);
+      if (next.has(competitorId)) next.delete(competitorId);
+      else next.add(competitorId);
+      return next;
+    });
+  };
+
+  const closeDeleteModal = () => {
+    if (isDeleting) return;
+    setDeleteOpen(false);
+    setDeleteSelectedIds(new Set());
+  };
+
+  const confirmDeleteBrands = async () => {
+    const ids = Array.from(deleteSelectedIds);
+    if (ids.length === 0) return;
+    setIsDeleting(true);
+    try {
+      const handler = onDeleteCompetitors || ((selectedIds) => Promise.all(selectedIds.map(id => onDeleteCompetitor(id))));
+      await handler(ids);
+      setDeleteOpen(false);
+      setDeleteSelectedIds(new Set());
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setIsDeleting(false);
+    }
+  };
 
   const handleDragStart = (e, competitorId) => {
     e.dataTransfer.setData('competitorId', competitorId);
@@ -120,7 +164,7 @@ export default function Sidebar({
                 }}>📁 폴더로 이동</button>
                 <button className="danger" onClick={() => {
                   setMenuOpenId(null);
-                  onDeleteCompetitor(c.id).catch(err => setError(err.message));
+                  openDeleteModal(c.id);
                 }}>🗑️ 브랜드 삭제</button>
               </div>
             )}
@@ -307,6 +351,63 @@ export default function Sidebar({
                   📁 {f.name}
                 </button>
               ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {deleteOpen && (
+        <div className="dialog-backdrop" onClick={closeDeleteModal}>
+          <div className="modal-card delete-brands-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <div>
+                <h2>브랜드 삭제</h2>
+                <p className="modal-subtitle">삭제할 브랜드를 선택하세요.</p>
+              </div>
+              <button className="icon" onClick={closeDeleteModal} disabled={isDeleting}>닫기</button>
+            </div>
+
+            <div className="delete-brand-groups">
+              {deleteGroups.map(group => (
+                <section className="delete-brand-group" key={group.id}>
+                  <div className="delete-brand-group-title">
+                    <span>{group.name}</span>
+                    <span>{group.competitors.length} 브랜드</span>
+                  </div>
+                  <div className="delete-brand-grid">
+                    {group.competitors.map(c => (
+                      <label className="delete-brand-item" key={c.id}>
+                        <input
+                          type="checkbox"
+                          checked={deleteSelectedIds.has(c.id)}
+                          onChange={() => toggleDeleteSelection(c.id)}
+                          disabled={isDeleting}
+                        />
+                        {c.brand_logo_url ? (
+                          <img className="small-logo" src={c.brand_logo_url} alt="" />
+                        ) : (
+                          <div className="small-logo" />
+                        )}
+                        <span title={c.brand}>{c.brand}</span>
+                      </label>
+                    ))}
+                  </div>
+                </section>
+              ))}
+            </div>
+
+            <div className="modal-actions">
+              <button className="ghost" type="button" onClick={closeDeleteModal} disabled={isDeleting}>
+                취소
+              </button>
+              <button
+                className="primary danger-action"
+                type="button"
+                onClick={confirmDeleteBrands}
+                disabled={isDeleting || deleteSelectedIds.size === 0}
+              >
+                {isDeleting ? '삭제 중...' : `삭제하기 (${deleteSelectedIds.size})`}
+              </button>
             </div>
           </div>
         </div>

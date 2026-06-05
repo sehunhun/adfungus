@@ -475,6 +475,17 @@ def parse_ad_card(card: Any) -> Optional[Dict[str, Any]]:
     platforms = _infer_platforms(card_text)
     ad_format = _detect_format(media["images"], media["videos"])
 
+    # 영상 길이를 확인할 수 없거나 120초(2분) 이상인 광고는 제외
+    for v in media["videos"]:
+        d = v.get("duration")
+        if d is None or d >= 120:
+            LOGGER.debug(
+                "Skipping ad library_id=%s: video duration=%s is missing or >= 120s",
+                library_id,
+                d,
+            )
+            return None
+
     return {
         "libraryID": library_id,
         "brand": brand_data["brand"],
@@ -572,6 +583,434 @@ async def _count_library_ids_on_page(page: Any) -> int:
         return -1
 
 
+def _network_debug_enabled() -> bool:
+    return os.getenv("DEBUG_NETWORK", "").lower() in {"1", "true", "yes"}
+
+
+def _session_proxy_from_env() -> Optional[Dict[str, str]]:
+    proxy_url = os.getenv("PROXY_URL", "").strip()
+    if not proxy_url:
+        return None
+    if "://" not in proxy_url:
+        proxy_url = f"http://{proxy_url}"
+    parsed = urlparse(proxy_url)
+    if not parsed.hostname:
+        return {"server": proxy_url}
+    server = f"{parsed.scheme or 'http'}://{parsed.hostname}"
+    if parsed.port:
+        server = f"{server}:{parsed.port}"
+    proxy_config = {"server": server}
+    if parsed.username:
+        proxy_config["username"] = unquote(parsed.username)
+    if parsed.password:
+        proxy_config["password"] = unquote(parsed.password)
+    return proxy_config
+
+
+def _network_kind(url: str) -> str:
+    lowered = url.lower()
+    if "graphql" in lowered:
+        return "graphql"
+    if "ajax" in lowered:
+        return "ajax"
+    if "async" in lowered:
+        return "async"
+    if "ads/library" in lowered:
+        return "ads_library"
+    if "relay" in lowered:
+        return "relay"
+    if "comet" in lowered:
+        return "comet"
+    if "/api/" in lowered or lowered.endswith("/api"):
+        return "api"
+    return ""
+
+
+def _network_status_bucket(status: int) -> str:
+    if 200 <= status <= 299:
+        return "2xx"
+    if 300 <= status <= 399:
+        return "3xx"
+    if 400 <= status <= 499:
+        return "4xx"
+    if 500 <= status <= 599:
+        return "5xx"
+    return "other"
+
+
+def _safe_json_loads(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except Exception:
+        return None
+
+
+def _graphql_operation_from_request(request: Any) -> str:
+    try:
+        method = getattr(request, "method", "")
+        if callable(method):
+            method = method()
+        if str(method or "").upper() != "POST":
+            return "GET"
+    except Exception:
+        pass
+
+    try:
+        body = getattr(request, "post_data", None)
+        if callable(body):
+            body = body()
+    except Exception:
+        body = None
+    if not body:
+        return "unknown"
+
+    parsed = parse_qs(str(body), keep_blank_values=True)
+    friendly = (parsed.get("fb_api_req_friendly_name") or [""])[0].strip()
+    doc_id = (parsed.get("doc_id") or [""])[0].strip()
+    variables_raw = (parsed.get("variables") or [""])[0]
+    variables = _safe_json_loads(variables_raw) if variables_raw else None
+    variable_keys = set(variables.keys()) if isinstance(variables, dict) else set()
+    flags = []
+    if "cursor" in variable_keys:
+        flags.append("cursor")
+    if "count" in variable_keys:
+        flags.append("count")
+    if "first" in variable_keys:
+        flags.append("first")
+    if "query" in variable_keys:
+        flags.append("query")
+    suffix = f"[{','.join(flags)}]" if flags else ""
+    if friendly:
+        return f"{friendly}{suffix}"
+    if doc_id:
+        return f"doc_id:{doc_id}{suffix}"
+    return f"unknown{suffix}"
+
+
+async def _response_text_preview(response: Any) -> str:
+    try:
+        text_fn = getattr(response, "text", None)
+        if callable(text_fn):
+            value = text_fn()
+            if hasattr(value, "__await__"):
+                value = await value
+            return str(value or "")
+    except Exception:
+        pass
+    try:
+        body_fn = getattr(response, "body", None)
+        if callable(body_fn):
+            value = body_fn()
+            if hasattr(value, "__await__"):
+                value = await value
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="ignore")
+            return str(value or "")
+    except Exception:
+        pass
+    return ""
+
+
+def _graphql_response_detail(text: str) -> Dict[str, Any]:
+    return {
+        "bytes": len(text.encode("utf-8", errors="ignore")),
+        "library_id_hits": len(re.findall(r'"(?:ad_archive_id|library_id)"\s*:\s*"?\d+', text)),
+        "edges_hits": len(re.findall(r'"edges"\s*:', text)),
+        "has_next_page": '"has_next_page":true' in text.replace(" ", "").lower(),
+    }
+
+
+def _response_header(response: Any, name: str) -> str:
+    try:
+        headers = getattr(response, "headers", {}) or {}
+        if callable(headers):
+            headers = headers()
+        if isinstance(headers, dict):
+            return str(headers.get(name) or headers.get(name.lower()) or "")
+    except Exception:
+        pass
+    return ""
+
+
+def _compact_response_preview(text: str, *, limit: int = 600) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    compact = re.sub(r'(access_token=)[^&"\s]+', r"\1[redacted]", compact)
+    compact = re.sub(r'("access_token"\s*:\s*")[^"]+', r'\1[redacted]', compact)
+    if len(compact) > limit:
+        return compact[:limit] + "...[truncated]"
+    return compact
+
+
+class _NetworkDebugMonitor:
+    def __init__(self, page: Any, *, enabled: bool) -> None:
+        self.page = page
+        self.enabled = enabled
+        self.requests: Dict[str, int] = {}
+        self.responses: Dict[str, int] = {}
+        self.statuses: Dict[str, int] = {}
+        self.failed: Dict[str, int] = {}
+        self.graphql_ops: Dict[str, int] = {}
+        self.graphql_response_ops: Dict[str, int] = {}
+        self.graphql_detail_ops: Dict[str, int] = {}
+        self.graphql_detail_bytes: Dict[str, int] = {}
+        self.graphql_detail_library_ids: Dict[str, int] = {}
+        self.graphql_detail_edges: Dict[str, int] = {}
+        self.graphql_detail_has_next_page: Dict[str, int] = {}
+        self.last_requests: Dict[str, int] = {}
+        self.last_responses: Dict[str, int] = {}
+        self.last_statuses: Dict[str, int] = {}
+        self.last_failed: Dict[str, int] = {}
+        self.last_graphql_ops: Dict[str, int] = {}
+        self.last_graphql_response_ops: Dict[str, int] = {}
+        self.last_graphql_detail_ops: Dict[str, int] = {}
+        self.last_graphql_detail_bytes: Dict[str, int] = {}
+        self.last_graphql_detail_library_ids: Dict[str, int] = {}
+        self.last_graphql_detail_edges: Dict[str, int] = {}
+        self.last_graphql_detail_has_next_page: Dict[str, int] = {}
+        self.attached = False
+
+    def attach(self) -> None:
+        if not self.enabled or self.attached:
+            return
+        try:
+            self.page.on("request", self._on_request)
+            self.page.on("response", self._on_response)
+            self.page.on("requestfailed", self._on_request_failed)
+            self.attached = True
+        except Exception as exc:
+            LOGGER.debug("network-debug attach failed: %s", exc)
+            self.enabled = False
+
+    def detach(self) -> None:
+        if not self.enabled or not self.attached:
+            return
+        try:
+            off = getattr(self.page, "off", None)
+            if callable(off):
+                off("request", self._on_request)
+                off("response", self._on_response)
+                off("requestfailed", self._on_request_failed)
+        except Exception:
+            pass
+        self.attached = False
+
+    def _increment(self, data: Dict[str, int], key: str) -> None:
+        data[key] = data.get(key, 0) + 1
+
+    def _add(self, data: Dict[str, int], key: str, value: int) -> None:
+        data[key] = data.get(key, 0) + value
+
+    def _request_url(self, request: Any) -> str:
+        value = getattr(request, "url", "")
+        if callable(value):
+            try:
+                return str(value())
+            except Exception:
+                return ""
+        return str(value or "")
+
+    def _on_request(self, request: Any) -> None:
+        url = self._request_url(request)
+        kind = _network_kind(url)
+        if not kind:
+            return
+        self._increment(self.requests, kind)
+        if kind == "graphql":
+            self._increment(self.graphql_ops, _graphql_operation_from_request(request))
+
+    def _on_response(self, response: Any) -> None:
+        try:
+            request = getattr(response, "request", None)
+            url = self._request_url(request) if request is not None else str(getattr(response, "url", "") or "")
+            kind = _network_kind(url)
+            if not kind:
+                return
+            status = int(getattr(response, "status", 0) or 0)
+        except Exception:
+            return
+        self._increment(self.responses, kind)
+        self._increment(self.statuses, _network_status_bucket(status))
+        if kind == "graphql" and request is not None:
+            operation = _graphql_operation_from_request(request)
+            self._increment(self.graphql_response_ops, operation)
+            if operation.startswith("AdLibrarySearchPaginationQuery"):
+                try:
+                    asyncio.create_task(self._collect_graphql_detail(response, operation))
+                except Exception:
+                    pass
+
+    async def _collect_graphql_detail(self, response: Any, operation: str) -> None:
+        try:
+            text = await _response_text_preview(response)
+            if not text:
+                return
+            detail = _graphql_response_detail(text)
+        except Exception:
+            return
+        self._increment(self.graphql_detail_ops, operation)
+        self._add(self.graphql_detail_bytes, operation, int(detail["bytes"]))
+        self._add(
+            self.graphql_detail_library_ids,
+            operation,
+            int(detail["library_id_hits"]),
+        )
+        self._add(self.graphql_detail_edges, operation, int(detail["edges_hits"]))
+        if detail["has_next_page"]:
+            self._increment(self.graphql_detail_has_next_page, operation)
+        if int(detail["bytes"]) <= 2048 or (
+            int(detail["library_id_hits"]) == 0 and int(detail["edges_hits"]) == 0
+        ):
+            try:
+                status = int(getattr(response, "status", 0) or 0)
+            except Exception:
+                status = 0
+            LOGGER.debug(
+                "graphql-response-preview operation=%s status=%s content_type=%s bytes=%s library_id_hits=%s edges_hits=%s has_next_page=%s body=%s",
+                operation,
+                status,
+                _response_header(response, "content-type"),
+                detail["bytes"],
+                detail["library_id_hits"],
+                detail["edges_hits"],
+                detail["has_next_page"],
+                _compact_response_preview(text),
+            )
+
+    def _on_request_failed(self, request: Any) -> None:
+        kind = _network_kind(self._request_url(request))
+        if not kind:
+            return
+        self._increment(self.failed, kind)
+
+    def _delta(self, current: Dict[str, int], previous: Dict[str, int]) -> Dict[str, int]:
+        delta: Dict[str, int] = {}
+        for key, value in current.items():
+            diff = value - previous.get(key, 0)
+            if diff:
+                delta[key] = diff
+        previous.clear()
+        previous.update(current)
+        return delta
+
+    def log_delta(self, *, phase: str, round_index: int) -> None:
+        if not self.enabled:
+            return
+        request_delta = self._delta(self.requests, self.last_requests)
+        response_delta = self._delta(self.responses, self.last_responses)
+        status_delta = self._delta(self.statuses, self.last_statuses)
+        failed_delta = self._delta(self.failed, self.last_failed)
+        graphql_ops_delta = self._delta(self.graphql_ops, self.last_graphql_ops)
+        graphql_response_ops_delta = self._delta(
+            self.graphql_response_ops,
+            self.last_graphql_response_ops,
+        )
+        graphql_detail_delta = self._delta(
+            self.graphql_detail_ops,
+            self.last_graphql_detail_ops,
+        )
+        graphql_detail_bytes_delta = self._delta(
+            self.graphql_detail_bytes,
+            self.last_graphql_detail_bytes,
+        )
+        graphql_detail_library_ids_delta = self._delta(
+            self.graphql_detail_library_ids,
+            self.last_graphql_detail_library_ids,
+        )
+        graphql_detail_edges_delta = self._delta(
+            self.graphql_detail_edges,
+            self.last_graphql_detail_edges,
+        )
+        graphql_detail_next_delta = self._delta(
+            self.graphql_detail_has_next_page,
+            self.last_graphql_detail_has_next_page,
+        )
+        if not (
+            request_delta
+            or response_delta
+            or status_delta
+            or failed_delta
+            or graphql_ops_delta
+            or graphql_response_ops_delta
+            or graphql_detail_delta
+            or graphql_detail_bytes_delta
+            or graphql_detail_library_ids_delta
+            or graphql_detail_edges_delta
+            or graphql_detail_next_delta
+        ):
+            return
+        LOGGER.debug(
+            "network-delta phase=%s round=%s requests=%s responses=%s statuses=%s failed=%s graphql_ops=%s graphql_response_ops=%s graphql_details=%s graphql_detail_bytes=%s graphql_detail_library_ids=%s graphql_detail_edges=%s graphql_detail_has_next_page=%s",
+            phase,
+            round_index,
+            request_delta,
+            response_delta,
+            status_delta,
+            failed_delta,
+            graphql_ops_delta,
+            graphql_response_ops_delta,
+            graphql_detail_delta,
+            graphql_detail_bytes_delta,
+            graphql_detail_library_ids_delta,
+            graphql_detail_edges_delta,
+            graphql_detail_next_delta,
+        )
+
+    def log_summary(self, *, phase: str) -> None:
+        if not self.enabled:
+            return
+        LOGGER.debug(
+            "network-summary phase=%s requests=%s responses=%s statuses=%s failed=%s graphql_ops=%s graphql_response_ops=%s graphql_details=%s graphql_detail_bytes=%s graphql_detail_library_ids=%s graphql_detail_edges=%s graphql_detail_has_next_page=%s",
+            phase,
+            self.requests,
+            self.responses,
+            self.statuses,
+            self.failed,
+            self.graphql_ops,
+            self.graphql_response_ops,
+            self.graphql_detail_ops,
+            self.graphql_detail_bytes,
+            self.graphql_detail_library_ids,
+            self.graphql_detail_edges,
+            self.graphql_detail_has_next_page,
+        )
+
+
+async def _nudge_lazy_scroll(
+    page: Any,
+    round_index: int,
+    *,
+    stuck_rounds: int,
+    bottom_reached: bool,
+) -> str:
+    if bottom_reached and stuck_rounds >= 5:
+        action = "jitter_wheel"
+        try:
+            await page.evaluate("window.scrollBy(0, -500)")
+        except Exception:
+            pass
+        try:
+            await page.mouse.wheel(0, 1800)
+            return action
+        except Exception:
+            try:
+                await page.keyboard.press("PageDown")
+                return "jitter_pagedown"
+            except Exception:
+                await page.evaluate("window.scrollBy(0, 1800)")
+                return "jitter_scrollby"
+
+    try:
+        await page.mouse.wheel(0, 1400)
+        return "wheel"
+    except Exception:
+        try:
+            await page.keyboard.press("PageDown")
+            return "pagedown"
+        except Exception:
+            await page.evaluate("window.scrollBy(0, 1400)")
+            return "scrollby"
+
+
 async def _wait_until_stable_cards(
     page: Any,
     *,
@@ -584,85 +1023,105 @@ async def _wait_until_stable_cards(
     idle_rounds = 0
     prev_library_id_count = -1
     prev_scroll_height = -1
+    prev_bottom_reached = False
+    scroll_action = "none"
+    network_monitor = _NetworkDebugMonitor(page, enabled=debug and _network_debug_enabled())
+    network_monitor.attach()
 
-    for idx in range(max_rounds):
-        try:
-            metrics = await page.evaluate(
-                r"""
-                (sel) => {
-                  window.scrollTo(0, document.body.scrollHeight);
-                  const text = document.body ? document.body.innerText : '';
-                  const matches = text.match(/(?:라이브러리\s*ID|Library\s+ID|Ad\s+library\s+ID)\s*:\s*\d+/gi);
-                  const scrollHeight = document.body ? document.body.scrollHeight : 0;
-                  const bottomReached = window.scrollY + window.innerHeight >= scrollHeight - 8;
-                  return {
-                    count: document.querySelectorAll(sel).length,
-                    libraryIdCount: matches ? matches.length : 0,
-                    scrollHeight,
-                    scrollY: window.scrollY,
-                    innerHeight: window.innerHeight,
-                    bottomReached,
-                  };
+    try:
+        for idx in range(max_rounds):
+            try:
+                scroll_action = await _nudge_lazy_scroll(
+                    page,
+                    idx,
+                    stuck_rounds=idle_rounds,
+                    bottom_reached=prev_bottom_reached,
+                )
+            except Exception:
+                scroll_action = "failed"
+
+            try:
+                metrics = await page.evaluate(
+                    r"""
+                    (sel) => {
+                      const text = document.body ? document.body.innerText : '';
+                      const matches = text.match(/(?:라이브러리\s*ID|Library\s+ID|Ad\s+library\s+ID)\s*:\s*\d+/gi);
+                      const scrollHeight = document.body ? document.body.scrollHeight : 0;
+                      const bottomReached = window.scrollY + window.innerHeight >= scrollHeight - 8;
+                      return {
+                        count: document.querySelectorAll(sel).length,
+                        libraryIdCount: matches ? matches.length : 0,
+                        scrollHeight,
+                        scrollY: window.scrollY,
+                        innerHeight: window.innerHeight,
+                        bottomReached,
+                      };
+                    }
+                    """,
+                    selector,
+                )
+            except Exception:
+                metrics = {
+                    "count": -1,
+                    "libraryIdCount": -1,
+                    "scrollHeight": -1,
+                    "scrollY": -1,
+                    "innerHeight": -1,
+                    "bottomReached": False,
                 }
-                """,
-                selector,
-            )
-        except Exception:
-            metrics = {
-                "count": -1,
-                "libraryIdCount": -1,
-                "scrollHeight": -1,
-                "scrollY": -1,
-                "innerHeight": -1,
-                "bottomReached": False,
-            }
 
-        count = int(metrics.get("count", -1))
-        library_id_count = int(metrics.get("libraryIdCount", -1))
-        scroll_height = int(metrics.get("scrollHeight", -1))
-        scroll_y = int(metrics.get("scrollY", -1))
-        inner_height = int(metrics.get("innerHeight", -1))
-        bottom_reached = bool(metrics.get("bottomReached"))
+            count = int(metrics.get("count", -1))
+            library_id_count = int(metrics.get("libraryIdCount", -1))
+            scroll_height = int(metrics.get("scrollHeight", -1))
+            scroll_y = int(metrics.get("scrollY", -1))
+            inner_height = int(metrics.get("innerHeight", -1))
+            bottom_reached = bool(metrics.get("bottomReached"))
 
-        height_stable = scroll_height == prev_scroll_height and scroll_height >= 0
-        ids_stable = library_id_count == prev_library_id_count and library_id_count > 0
-        if height_stable and ids_stable and bottom_reached:
-            idle_rounds += 1
-        else:
-            idle_rounds = 0
+            height_stable = scroll_height == prev_scroll_height and scroll_height >= 0
+            ids_stable = library_id_count == prev_library_id_count and library_id_count > 0
+            if height_stable and ids_stable and bottom_reached:
+                idle_rounds += 1
+            else:
+                idle_rounds = 0
 
-        if debug:
-            LOGGER.debug(
-                "stable-scroll round=%s selector=%s count=%s library_id_text_count=%s scroll_height=%s scroll_y=%s inner_height=%s bottom_reached=%s idle_rounds=%s/%s",
-                idx + 1,
-                selector,
-                count,
-                library_id_count,
-                scroll_height,
-                scroll_y,
-                inner_height,
-                bottom_reached,
-                idle_rounds,
-                stable_rounds,
-            )
-
-        if idle_rounds >= stable_rounds:
             if debug:
                 LOGGER.debug(
-                    "stable-scroll satisfied at round=%s count=%s library_id_text_count=%s scroll_height=%s",
+                    "stable-scroll round=%s selector=%s count=%s library_id_text_count=%s scroll_height=%s scroll_y=%s inner_height=%s bottom_reached=%s idle_rounds=%s/%s scroll_action=%s",
                     idx + 1,
+                    selector,
                     count,
                     library_id_count,
                     scroll_height,
+                    scroll_y,
+                    inner_height,
+                    bottom_reached,
+                    idle_rounds,
+                    stable_rounds,
+                    scroll_action,
                 )
-            return
+                network_monitor.log_delta(phase="stable", round_index=idx + 1)
 
-        prev_library_id_count = library_id_count
-        prev_scroll_height = scroll_height
-        try:
-            await page.wait_for_timeout(wait_ms)
-        except Exception:
-            await asyncio.sleep(wait_ms / 1000)
+            if idle_rounds >= stable_rounds:
+                if debug:
+                    LOGGER.debug(
+                        "stable-scroll satisfied at round=%s count=%s library_id_text_count=%s scroll_height=%s",
+                        idx + 1,
+                        count,
+                        library_id_count,
+                        scroll_height,
+                    )
+                return
+
+            prev_library_id_count = library_id_count
+            prev_scroll_height = scroll_height
+            prev_bottom_reached = bottom_reached
+            try:
+                await page.wait_for_timeout(wait_ms)
+            except Exception:
+                await asyncio.sleep(wait_ms / 1000)
+    finally:
+        network_monitor.log_summary(phase="stable")
+        network_monitor.detach()
 
 
 async def _wait_until_min_library_ids(
@@ -673,30 +1132,99 @@ async def _wait_until_min_library_ids(
     wait_ms: int,
     debug: bool,
 ) -> None:
-    for idx in range(max_rounds):
-        library_id_count = await _count_library_ids_on_page(page)
-        card_count = await _count_dom_matches(page, AD_CARD_SELECTOR)
-        if debug:
-            LOGGER.debug(
-                "target-load round=%s scoped_card_selector_count=%s library_id_text_count=%s target=%s",
-                idx + 1,
-                card_count,
-                library_id_count,
-                target_count,
-            )
-        if library_id_count >= target_count:
+    prev_library_id_count = -1
+    prev_scroll_height = -1
+    prev_bottom_reached = False
+    stuck_rounds = 0
+    scroll_action = "none"
+    network_monitor = _NetworkDebugMonitor(page, enabled=debug and _network_debug_enabled())
+    network_monitor.attach()
+
+    try:
+        for idx in range(max_rounds):
+            try:
+                scroll_action = await _nudge_lazy_scroll(
+                    page,
+                    idx,
+                    stuck_rounds=stuck_rounds,
+                    bottom_reached=prev_bottom_reached,
+                )
+            except Exception:
+                scroll_action = "failed"
+
+            try:
+                metrics = await page.evaluate(
+                    r"""
+                    (sel) => {
+                      const text = document.body ? document.body.innerText : '';
+                      const matches = text.match(/(?:라이브러리\s*ID|Library\s+ID|Ad\s+library\s+ID)\s*:\s*\d+/gi);
+                      const scrollHeight = document.body ? document.body.scrollHeight : 0;
+                      const bottomReached = window.scrollY + window.innerHeight >= scrollHeight - 8;
+                      return {
+                        cardCount: document.querySelectorAll(sel).length,
+                        libraryIdCount: matches ? matches.length : 0,
+                        scrollHeight,
+                        bottomReached,
+                      };
+                    }
+                    """,
+                    AD_CARD_SELECTOR,
+                )
+            except Exception:
+                metrics = {
+                    "cardCount": -1,
+                    "libraryIdCount": -1,
+                    "scrollHeight": -1,
+                    "bottomReached": False,
+                }
+
+            library_id_count = int(metrics.get("libraryIdCount", -1))
+            card_count = int(metrics.get("cardCount", -1))
+            scroll_height = int(metrics.get("scrollHeight", -1))
+            bottom_reached = bool(metrics.get("bottomReached"))
+
+            if (
+                library_id_count == prev_library_id_count
+                and scroll_height == prev_scroll_height
+                and library_id_count > 0
+                and scroll_height >= 0
+                and bottom_reached
+            ):
+                stuck_rounds += 1
+            else:
+                stuck_rounds = 0
+
             if debug:
                 LOGGER.debug(
-                    "target-load satisfied library_id_text_count=%s target=%s",
+                    "target-load round=%s scoped_card_selector_count=%s library_id_text_count=%s target=%s scroll_height=%s bottom_reached=%s stuck_rounds=%s scroll_action=%s",
+                    idx + 1,
+                    card_count,
                     library_id_count,
                     target_count,
+                    scroll_height,
+                    bottom_reached,
+                    stuck_rounds,
+                    scroll_action,
                 )
-            return
-        try:
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(wait_ms)
-        except Exception:
-            await asyncio.sleep(wait_ms / 1000)
+                network_monitor.log_delta(phase="target", round_index=idx + 1)
+            if library_id_count >= target_count:
+                if debug:
+                    LOGGER.debug(
+                        "target-load satisfied library_id_text_count=%s target=%s",
+                        library_id_count,
+                        target_count,
+                    )
+                return
+            prev_library_id_count = library_id_count
+            prev_scroll_height = scroll_height
+            prev_bottom_reached = bottom_reached
+            try:
+                await page.wait_for_timeout(wait_ms)
+            except Exception:
+                await asyncio.sleep(wait_ms / 1000)
+    finally:
+        network_monitor.log_summary(phase="target")
+        network_monitor.detach()
 
 
 async def _mark_top_ad_cards(page: Any, *, limit: int, debug: bool) -> List[str]:
@@ -882,13 +1410,17 @@ async def _fetch_advertiser_detail(
     *,
     debug: bool,
 ) -> Dict[str, Any] | None:
-    async with AsyncStealthySession(
-        headless=True,
-        real_chrome=os.getenv("META_ADS_REAL_CHROME", "true").lower()
+    session_config: Dict[str, Any] = {
+        "headless": True,
+        "real_chrome": os.getenv("META_ADS_REAL_CHROME", "true").lower()
         not in {"0", "false", "no"},
-        timeout=120000,
-        max_pages=1,
-    ) as session:
+        "timeout": 120000,
+        "max_pages": 1,
+    }
+    proxy_url = _session_proxy_from_env()
+    if proxy_url:
+        session_config["proxy"] = proxy_url
+    async with AsyncStealthySession(**session_config) as session:
         return await _fetch_advertiser_detail_with_session(
             session,
             candidate,
@@ -978,49 +1510,74 @@ def _merge_same_source_groups(
     debug: bool,
 ) -> List[Dict[str, Any]]:
     by_id: Dict[str, Dict[str, Any]] = {}
-    same_source_by_id: Dict[str, set[str]] = {}
+    # same_source_by_id maps library_id -> set of version info tuples (id, startDate)
+    same_source_by_id: Dict[str, set[tuple[str, str]]] = {}
+
+    def _get_ver_info(item: Dict[str, Any]) -> tuple[str, str]:
+        return (str(item.get("libraryID", "")).strip(), str(item.get("startDate", "")).strip())
 
     for item in main_items:
-        library_id = str(item.get("libraryID", "")).strip()
+        library_id, start_date = _get_ver_info(item)
         if not library_id:
             continue
         by_id[library_id] = item
-        same_source_by_id.setdefault(library_id, set()).update(
-            str(value) for value in item.get("sameSourceLibraryIDs", []) if value
-        )
+        
+        # Collect existing sameSourceLibraryIDs if they are already in the new format
+        existing = item.get("sameSourceLibraryIDs", [])
+        if existing and isinstance(existing[0], dict):
+            for v in existing:
+                same_source_by_id.setdefault(library_id, set()).add((v["id"], v.get("startDate", "")))
+        else:
+            # Fallback for old format or empty
+            same_source_by_id.setdefault(library_id, set()).add((library_id, start_date))
 
     for group_idx, group in enumerate(popup_groups):
-        group_ids = [str(item.get("libraryID", "")).strip() for item in group]
-        group_ids = [value for value in dict.fromkeys(group_ids) if value]
+        # Extract version info (id, startDate) for all items in the popup group
+        group_infos = [_get_ver_info(item) for item in group]
+        group_infos = [info for info in group_infos if info[0]]
+        
         if debug:
-            LOGGER.debug("summary_group[%s] ids=%s", group_idx, group_ids)
-        if len(group_ids) < 2:
+            LOGGER.debug("summary_group[%s] ids=%s", group_idx, [i[0] for i in group_infos])
+        if len(group_infos) < 2:
             continue
 
         for item in group:
-            library_id = str(item.get("libraryID", "")).strip()
+            library_id, _ = _get_ver_info(item)
             if not library_id:
                 continue
             if library_id not in by_id:
                 by_id[library_id] = item
-            same_source_by_id.setdefault(library_id, set()).update(
-                other_id for other_id in group_ids if other_id != library_id
-            )
+            
+            # Add ALL members of the group (including self) to this item's same-source list
+            for other_id, other_start in group_infos:
+                same_source_by_id.setdefault(library_id, set()).add((other_id, other_start))
 
     merged: List[Dict[str, Any]] = []
     emitted = set()
+
+    # We want to keep original main items first
     for item in main_items:
-        library_id = str(item.get("libraryID", "")).strip()
+        library_id, _ = _get_ver_info(item)
         if not library_id or library_id in emitted:
             continue
-        item["sameSourceLibraryIDs"] = sorted(same_source_by_id.get(library_id, set()))
+        
+        # Convert set of tuples to list of dicts, sorted by ID
+        raw_versions = same_source_by_id.get(library_id, set())
+        item["sameSourceLibraryIDs"] = [
+            {"id": vid, "startDate": vsd} 
+            for vid, vsd in sorted(list(raw_versions))
+        ]
         merged.append(item)
         emitted.add(library_id)
 
     for library_id, item in by_id.items():
         if library_id in emitted:
             continue
-        item["sameSourceLibraryIDs"] = sorted(same_source_by_id.get(library_id, set()))
+        raw_versions = same_source_by_id.get(library_id, set())
+        item["sameSourceLibraryIDs"] = [
+            {"id": vid, "startDate": vsd} 
+            for vid, vsd in sorted(list(raw_versions))
+        ]
         merged.append(item)
         emitted.add(library_id)
 
@@ -1132,6 +1689,9 @@ async def crawl_meta_ads(
         "timeout": 120000,
         "max_pages": 1,
     }
+    proxy_url = _session_proxy_from_env()
+    if proxy_url:
+        session_config["proxy"] = proxy_url
 
     if debug:
         LOGGER.debug("fetch url=%s filter_page_id(no-op)=%s", url, filter_page_id)
@@ -1210,13 +1770,18 @@ async def search_meta_advertisers(
 
     results: List[Dict[str, Any]] = []
 
-    async with AsyncStealthySession(
-        headless=True,
-        real_chrome=os.getenv("META_ADS_REAL_CHROME", "true").lower()
+    session_config: Dict[str, Any] = {
+        "headless": True,
+        "real_chrome": os.getenv("META_ADS_REAL_CHROME", "true").lower()
         not in {"0", "false", "no"},
-        timeout=120000,
-        max_pages=1,
-    ) as session:
+        "timeout": 120000,
+        "max_pages": 1,
+    }
+    proxy_url = _session_proxy_from_env()
+    if proxy_url:
+        session_config["proxy"] = proxy_url
+
+    async with AsyncStealthySession(**session_config) as session:
         if debug:
             LOGGER.info("[Search] AsyncStealthySession started")
 

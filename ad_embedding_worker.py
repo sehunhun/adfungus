@@ -114,6 +114,7 @@ def _pending_embedding_ads(conn: psycopg.Connection[Any], library_ids: List[str]
             f"""
             SELECT
                 a.library_id,
+                a.same_source_library_ids,
                 a.ad_format,
                 COALESCE(a.body, '') AS body,
                 m.url AS image_url,
@@ -389,7 +390,49 @@ def process_ad_embeddings(*, database_url: str, top_k: int = DEFAULT_TOP_K, libr
             embedded = 0
             for ad in pending:
                 library_id = str(ad["library_id"])
+                raw_same_source = ad.get("same_source_library_ids") or []
+                
+                # Normalize same_source_ids to a list of strings (hybrid support)
+                same_source_ids: List[str] = []
+                for item in raw_same_source:
+                    if isinstance(item, dict):
+                        if "id" in item:
+                            same_source_ids.append(str(item["id"]))
+                    else:
+                        same_source_ids.append(str(item))
+
                 try:
+                    # Check for sibling embeddings first
+                    sibling_embedding = None
+                    if same_source_ids:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                SELECT embedding FROM meta_ad_embeddings
+                                WHERE library_id = ANY(%s)
+                                LIMIT 1
+                                """,
+                                (same_source_ids,)
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                sibling_embedding = row[0]
+
+                    if sibling_embedding:
+                        LOGGER.info("copying embedding from sibling for library_id=%s", library_id)
+                        _store_embedding(conn, library_id, sibling_embedding)
+                        conn.commit()
+                        embedded += 1
+                        continue
+
+                    # If no sibling exists, only the leader should proceed to avoid race conditions.
+                    if same_source_ids:
+                        group_ids = sorted(same_source_ids)
+                        leader_id = group_ids[0]
+                        if library_id != leader_id:
+                            raise RuntimeError(f"Deferring embedding: waiting for leader {leader_id}")
+
+                    # If no sibling found and we are the leader (or have no siblings), generate new embedding via API
                     embedding = _embed_ad(client, ad)
                     _store_embedding(conn, library_id, embedding)
                     conn.commit()

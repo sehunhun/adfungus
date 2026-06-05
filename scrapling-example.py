@@ -29,6 +29,8 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import ProxyHandler, Request as UrlRequest, build_opener
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from jwt import InvalidTokenError, PyJWKClient, decode as jwt_decode
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 try:
@@ -86,6 +88,8 @@ AFFILIATE_REASON_NO_CANDIDATE_UNDER_PRICE = "no_candidate_under_price"
 AFFILIATE_REASON_SCRAPE_DATA_INCOMPLETE = "scrape_data_incomplete"
 AFFILIATE_REASON_AFFILIATE_API_EMPTY = "affiliate_api_empty"
 
+PUBLIC_PATHS = {"/", "/health", "/docs", "/redoc", "/openapi.json"}
+
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 ALI_HELPER_BASE_URL = os.getenv("ALI_HELPER_BASE_URL", DEFAULT_ALI_HELPER_BASE_URL).strip() or DEFAULT_ALI_HELPER_BASE_URL
@@ -93,6 +97,7 @@ AFFILIATE_CACHE_TTL_HOURS = int(os.getenv("AFFILIATE_CACHE_TTL_HOURS", str(DEFAU
 
 _fpjs_bundle_cache: Dict[str, str] = {}
 _fpjs_bundle_cache_lock = threading.Lock()
+_clerk_jwks_client: Optional[PyJWKClient] = None
 
 DEFAULT_FINGERPRINT_PROFILE_SETS = [
     {
@@ -3043,6 +3048,74 @@ def _to_bool(value: str, default: bool) -> bool:
     return default
 
 
+def _split_csv_env(name: str) -> List[str]:
+    return [part.strip() for part in os.getenv(name, "").split(",") if part.strip()]
+
+
+def _clerk_auth_enabled() -> bool:
+    default_enabled = bool(
+        os.getenv("CLERK_JWKS_URL", "").strip()
+        or os.getenv("CLERK_FRONTEND_API_URL", "").strip()
+    )
+    return _to_bool(
+        os.getenv("CLERK_AUTH_ENABLED", "1" if default_enabled else "0"),
+        default_enabled,
+    )
+
+
+def _clerk_jwks_url() -> str:
+    configured = os.getenv("CLERK_JWKS_URL", "").strip()
+    if configured:
+        return configured
+
+    frontend_api_url = os.getenv("CLERK_FRONTEND_API_URL", "").strip().rstrip("/")
+    if frontend_api_url:
+        return f"{frontend_api_url}/.well-known/jwks.json"
+
+    raise RuntimeError("CLERK_JWKS_URL or CLERK_FRONTEND_API_URL is required")
+
+
+def _get_clerk_jwks_client() -> PyJWKClient:
+    global _clerk_jwks_client
+    if _clerk_jwks_client is None:
+        _clerk_jwks_client = PyJWKClient(_clerk_jwks_url())
+    return _clerk_jwks_client
+
+
+def _extract_clerk_token(request: Request) -> Optional[str]:
+    authorization = request.headers.get("authorization", "").strip()
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return request.cookies.get("__session")
+
+
+def _verify_clerk_request(request: Request) -> Dict[str, Any]:
+    token = _extract_clerk_token(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing Clerk session token")
+
+    try:
+        signing_key = _get_clerk_jwks_client().get_signing_key_from_jwt(token)
+        decode_kwargs: Dict[str, Any] = {
+            "algorithms": ["RS256"],
+            "options": {"verify_aud": False},
+        }
+        issuer = os.getenv("CLERK_ISSUER", "").strip()
+        if issuer:
+            decode_kwargs["issuer"] = issuer
+        claims = jwt_decode(token, signing_key.key, **decode_kwargs)
+    except InvalidTokenError as exc:
+        raise HTTPException(status_code=401, detail="Invalid Clerk session token") from exc
+
+    authorized_parties = _split_csv_env("CLERK_AUTHORIZED_PARTIES")
+    azp = claims.get("azp")
+    if azp and authorized_parties and azp not in authorized_parties:
+        raise HTTPException(status_code=401, detail="Invalid Clerk authorized party")
+    if claims.get("sts") == "pending":
+        raise HTTPException(status_code=403, detail="Clerk session is pending")
+    return claims
+
+
 def build_pool_from_env() -> AsyncSessionScraper:
     requested_workers = int(os.getenv("SCRAPER_WORKERS", str(DEFAULT_WORKERS)))
     tabs = int(os.getenv("SCRAPER_TABS", str(DEFAULT_TABS)))
@@ -3145,6 +3218,27 @@ app = FastAPI(
     version="1.3.0",
 )
 scraper_pool: Optional[AsyncSessionScraper] = None
+
+
+@app.middleware("http")
+async def clerk_auth_middleware(request: Request, call_next):
+    if _clerk_auth_enabled() and request.url.path not in PUBLIC_PATHS:
+        try:
+            request.state.clerk_claims = _verify_clerk_request(request)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        except Exception as exc:
+            _log_event(
+                logging.ERROR,
+                "clerk.auth.error",
+                path=request.url.path,
+                error=str(exc),
+            )
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Clerk authentication is not configured correctly"},
+            )
+    return await call_next(request)
 
 
 @app.middleware("http")
