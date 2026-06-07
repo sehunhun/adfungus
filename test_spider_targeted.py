@@ -165,7 +165,7 @@ def main():
     os.environ["META_ADS_REAL_CHROME"] = (
         "true"  # (옵션) Headless 해제하고 싶으면 False로 변경
     )
-    os.environ["HEADLESS"] = "false"
+    os.environ["HEADLESS"] = "true"
     os.environ["FETCH_RETRIES"] = "1"
     os.environ["CHALLENGE_WAIT_MS"] = "90000"
 
@@ -173,7 +173,7 @@ def main():
     start_time = time.perf_counter()
 
     spider = TargetedAdFungusSpider(database_url=database_url)
-    spider.start(concurrency=4, engine="stealthy")
+    spider.start(concurrency=2, engine="stealthy")
 
     elapsed = time.perf_counter() - start_time
     LOGGER.info(f"--- Spider Crawl Finished in {elapsed:.2f} seconds ---")

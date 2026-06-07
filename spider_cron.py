@@ -243,8 +243,8 @@ def main():
     start_time = time.perf_counter()
     
     spider = AdFungusSpider(database_url=database_url)
-    # Set concurrency to 4 as discussed for safety vs speed balance
-    spider.start(concurrency=4, engine="stealthy")
+    # Keep spider concurrency conservative for Meta crawl stability.
+    spider.start(concurrency=2, engine="stealthy")
     
     elapsed = time.perf_counter() - start_time
     LOGGER.info(f"--- Spider Crawl Finished in {elapsed:.2f} seconds ---")
