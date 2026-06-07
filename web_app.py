@@ -98,6 +98,21 @@ def _to_bool(value: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _library_id_values(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    ids: list[str] = []
+    for value in values:
+        if isinstance(value, dict):
+            value = value.get("id") or value.get("library_id") or value.get("libraryID")
+        if value is None:
+            continue
+        library_id = str(value).strip()
+        if library_id:
+            ids.append(library_id)
+    return ids
+
+
 def _clerk_auth_enabled() -> bool:
     default_enabled = bool(
         os.getenv("CLERK_JWKS_URL", "").strip()
@@ -456,10 +471,8 @@ def state(
                 deduped_ads.append(ad)
                 
                 # 이 광고와 유사하다고 판명된 광고들을 모두 제외 목록에 추가
-                similars = ad.get("similar_library_ids") or []
-                if isinstance(similars, list):
-                    for sid in similars:
-                        excluded_ids.add(str(sid))
+                for sid in _library_id_values(ad.get("similar_library_ids")):
+                    excluded_ids.add(sid)
             
             total_count = len(deduped_ads)
             ads = deduped_ads[offset : offset + limit]
@@ -844,7 +857,12 @@ def get_ad_detail(library_id: str, request: Request) -> dict[str, Any]:
 
         # 3. 연관 소재(변형 광고 + 유사 광고) 정보 조회
         variations = []
-        variation_ids = list(set((ad.get("same_source_library_ids") or []) + (ad.get("similar_library_ids") or [])))
+        variation_ids = list(
+            dict.fromkeys(
+                _library_id_values(ad.get("same_source_library_ids"))
+                + _library_id_values(ad.get("similar_library_ids"))
+            )
+        )
         if variation_ids:
             variation_rows = conn.execute(
                 """

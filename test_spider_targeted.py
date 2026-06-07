@@ -27,13 +27,14 @@ from meta_ads_crawler import (
     _wait_until_min_library_ids,
     _wait_until_stable_cards,
     _collect_summary_popup_groups,
+    _wait_for_ads_library_ready,
     AD_CARD_SELECTOR,
 )
 
 LOGGER = logging.getLogger("spider-targeted")
 
 # 타겟팅할 브랜드의 competitor ID 목록
-TARGET_IDS = [93]  # [90, 79, 80, 88, 89, 82, 84, 85, 87, 91, 92, 86, 93]
+TARGET_IDS = [98]  # [90, 79, 80, 88, 89, 82, 84, 85, 87, 91, 92, 86, 93]
 
 
 class TargetedAdFungusSpider(AdFungusSpider):
@@ -76,6 +77,15 @@ class TargetedAdFungusSpider(AdFungusSpider):
                 popup_groups = []
 
                 async def page_action(page: Any) -> None:
+                    ready_state = await _wait_for_ads_library_ready(
+                        page,
+                        max_wait_ms=self.challenge_wait_ms,
+                        debug=self.debug,
+                    )
+                    if not ready_state.get("ready"):
+                        if self.debug:
+                            LOGGER.debug("ads-library-not-ready skip_scroll state=%s", ready_state)
+                        return
                     await page.wait_for_timeout(3000)
                     if limit_val > 0:
                         await _wait_until_min_library_ids(
@@ -140,7 +150,7 @@ class TargetedAdFungusSpider(AdFungusSpider):
                 },
                 page_action=page_action,
                 timeout=120000,
-                network_idle=True,
+                network_idle=False,
             )
 
 
@@ -155,6 +165,9 @@ def main():
     os.environ["META_ADS_REAL_CHROME"] = (
         "true"  # (옵션) Headless 해제하고 싶으면 False로 변경
     )
+    os.environ["HEADLESS"] = "false"
+    os.environ["FETCH_RETRIES"] = "1"
+    os.environ["CHALLENGE_WAIT_MS"] = "90000"
 
     LOGGER.info("--- Starting Targeted Spider Crawl (%s Brands) ---", len(TARGET_IDS))
     start_time = time.perf_counter()

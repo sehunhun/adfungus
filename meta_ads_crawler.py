@@ -607,6 +607,20 @@ def _session_proxy_from_env() -> Optional[Dict[str, str]]:
     return proxy_config
 
 
+def _session_user_data_dir_from_env() -> Optional[str]:
+    value = os.getenv("META_ADS_USER_DATA_DIR", "").strip() or os.getenv("USER_DATA_DIR", "").strip()
+    return value or None
+
+
+def _apply_session_env_options(session_config: Dict[str, Any]) -> None:
+    proxy_url = _session_proxy_from_env()
+    if proxy_url:
+        session_config["proxy"] = proxy_url
+    user_data_dir = _session_user_data_dir_from_env()
+    if user_data_dir:
+        session_config["user_data_dir"] = user_data_dir
+
+
 def _network_kind(url: str) -> str:
     lowered = url.lower()
     if "graphql" in lowered:
@@ -975,40 +989,101 @@ class _NetworkDebugMonitor:
         )
 
 
-async def _nudge_lazy_scroll(
-    page: Any,
-    round_index: int,
-    *,
-    stuck_rounds: int,
-    bottom_reached: bool,
-) -> str:
-    if bottom_reached and stuck_rounds >= 5:
-        action = "jitter_wheel"
-        try:
-            await page.evaluate("window.scrollBy(0, -500)")
-        except Exception:
-            pass
-        try:
-            await page.mouse.wheel(0, 1800)
-            return action
-        except Exception:
-            try:
-                await page.keyboard.press("PageDown")
-                return "jitter_pagedown"
-            except Exception:
-                await page.evaluate("window.scrollBy(0, 1800)")
-                return "jitter_scrollby"
-
+async def _ads_library_ready_state(page: Any) -> Dict[str, Any]:
     try:
-        await page.mouse.wheel(0, 1400)
-        return "wheel"
-    except Exception:
+        state = await page.evaluate(
+            r"""
+            () => {
+              const body = document.body;
+              const root = document.documentElement;
+              const text = body ? body.innerText : '';
+              const html = root ? root.innerHTML : '';
+              const matches = text.match(/(?:라이브러리\s*ID|Library\s+ID|Ad\s+library\s+ID)\s*:\s*\d+/gi);
+              const challenge =
+                html.includes('__rd_verify') ||
+                html.includes('challenge=') ||
+                text.includes('Rate limit exceeded');
+              return {
+                url: window.location.href,
+                title: document.title || '',
+                textLength: text.trim().length,
+                libraryIdCount: matches ? matches.length : 0,
+                challenge,
+              };
+            }
+            """
+        )
+    except Exception as exc:
+        return {
+            "url": "",
+            "title": "",
+            "textLength": 0,
+            "libraryIdCount": 0,
+            "challenge": False,
+            "error": str(exc),
+        }
+    if not isinstance(state, dict):
+        return {"url": "", "title": "", "textLength": 0, "libraryIdCount": 0, "challenge": False}
+    return state
+
+
+async def _wait_for_ads_library_ready(
+    page: Any,
+    *,
+    max_wait_ms: int,
+    poll_ms: int = 2000,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    if max_wait_ms <= 0:
+        state = await _ads_library_ready_state(page)
+        state["ready"] = True
+        return state
+
+    deadline = time.monotonic() + (max_wait_ms / 1000)
+    last_state: Dict[str, Any] = {}
+    round_index = 0
+    while time.monotonic() < deadline:
+        round_index += 1
+        state = await _ads_library_ready_state(page)
+        last_state = state
+        library_id_count = int(state.get("libraryIdCount") or 0)
+        text_length = int(state.get("textLength") or 0)
+        challenge = bool(state.get("challenge"))
+
+        if library_id_count > 0 or (text_length > 500 and not challenge):
+            state["ready"] = True
+            if debug:
+                LOGGER.debug(
+                    "ads-library-ready round=%s title=%r text_length=%s library_id_text_count=%s challenge=%s url=%s",
+                    round_index,
+                    state.get("title"),
+                    text_length,
+                    library_id_count,
+                    challenge,
+                    state.get("url"),
+                )
+            return state
+
+        if debug:
+            LOGGER.debug(
+                "ads-library-wait round=%s title=%r text_length=%s library_id_text_count=%s challenge=%s url=%s",
+                round_index,
+                state.get("title"),
+                text_length,
+                library_id_count,
+                challenge,
+                state.get("url"),
+            )
+
         try:
-            await page.keyboard.press("PageDown")
-            return "pagedown"
+            await page.wait_for_timeout(poll_ms)
         except Exception:
-            await page.evaluate("window.scrollBy(0, 1400)")
-            return "scrollby"
+            await asyncio.sleep(poll_ms / 1000)
+
+    last_state["ready"] = False
+    if debug:
+        LOGGER.debug("ads-library-wait-timeout max_wait_ms=%s state=%s", max_wait_ms, last_state)
+    return last_state
 
 
 async def _wait_until_stable_cards(
@@ -1023,105 +1098,85 @@ async def _wait_until_stable_cards(
     idle_rounds = 0
     prev_library_id_count = -1
     prev_scroll_height = -1
-    prev_bottom_reached = False
-    scroll_action = "none"
-    network_monitor = _NetworkDebugMonitor(page, enabled=debug and _network_debug_enabled())
-    network_monitor.attach()
 
-    try:
-        for idx in range(max_rounds):
-            try:
-                scroll_action = await _nudge_lazy_scroll(
-                    page,
-                    idx,
-                    stuck_rounds=idle_rounds,
-                    bottom_reached=prev_bottom_reached,
-                )
-            except Exception:
-                scroll_action = "failed"
-
-            try:
-                metrics = await page.evaluate(
-                    r"""
-                    (sel) => {
-                      const text = document.body ? document.body.innerText : '';
-                      const matches = text.match(/(?:라이브러리\s*ID|Library\s+ID|Ad\s+library\s+ID)\s*:\s*\d+/gi);
-                      const scrollHeight = document.body ? document.body.scrollHeight : 0;
-                      const bottomReached = window.scrollY + window.innerHeight >= scrollHeight - 8;
-                      return {
-                        count: document.querySelectorAll(sel).length,
-                        libraryIdCount: matches ? matches.length : 0,
-                        scrollHeight,
-                        scrollY: window.scrollY,
-                        innerHeight: window.innerHeight,
-                        bottomReached,
-                      };
-                    }
-                    """,
-                    selector,
-                )
-            except Exception:
-                metrics = {
-                    "count": -1,
-                    "libraryIdCount": -1,
-                    "scrollHeight": -1,
-                    "scrollY": -1,
-                    "innerHeight": -1,
-                    "bottomReached": False,
+    for idx in range(max_rounds):
+        try:
+            metrics = await page.evaluate(
+                r"""
+                (sel) => {
+                  window.scrollTo(0, document.body.scrollHeight);
+                  const text = document.body ? document.body.innerText : '';
+                  const matches = text.match(/(?:라이브러리\s*ID|Library\s+ID|Ad\s+library\s+ID)\s*:\s*\d+/gi);
+                  const scrollHeight = document.body ? document.body.scrollHeight : 0;
+                  const bottomReached = window.scrollY + window.innerHeight >= scrollHeight - 8;
+                  return {
+                    count: document.querySelectorAll(sel).length,
+                    libraryIdCount: matches ? matches.length : 0,
+                    scrollHeight,
+                    scrollY: window.scrollY,
+                    innerHeight: window.innerHeight,
+                    bottomReached,
+                  };
                 }
+                """,
+                selector,
+            )
+        except Exception:
+            metrics = {
+                "count": -1,
+                "libraryIdCount": -1,
+                "scrollHeight": -1,
+                "scrollY": -1,
+                "innerHeight": -1,
+                "bottomReached": False,
+            }
 
-            count = int(metrics.get("count", -1))
-            library_id_count = int(metrics.get("libraryIdCount", -1))
-            scroll_height = int(metrics.get("scrollHeight", -1))
-            scroll_y = int(metrics.get("scrollY", -1))
-            inner_height = int(metrics.get("innerHeight", -1))
-            bottom_reached = bool(metrics.get("bottomReached"))
+        count = int(metrics.get("count", -1))
+        library_id_count = int(metrics.get("libraryIdCount", -1))
+        scroll_height = int(metrics.get("scrollHeight", -1))
+        scroll_y = int(metrics.get("scrollY", -1))
+        inner_height = int(metrics.get("innerHeight", -1))
+        bottom_reached = bool(metrics.get("bottomReached"))
 
-            height_stable = scroll_height == prev_scroll_height and scroll_height >= 0
-            ids_stable = library_id_count == prev_library_id_count and library_id_count > 0
-            if height_stable and ids_stable and bottom_reached:
-                idle_rounds += 1
-            else:
-                idle_rounds = 0
+        height_stable = scroll_height == prev_scroll_height and scroll_height >= 0
+        ids_stable = library_id_count == prev_library_id_count and library_id_count > 0
+        if height_stable and ids_stable and bottom_reached:
+            idle_rounds += 1
+        else:
+            idle_rounds = 0
 
+        if debug:
+            LOGGER.debug(
+                "stable-scroll round=%s selector=%s count=%s library_id_text_count=%s scroll_height=%s scroll_y=%s inner_height=%s bottom_reached=%s idle_rounds=%s/%s",
+                idx + 1,
+                selector,
+                count,
+                library_id_count,
+                scroll_height,
+                scroll_y,
+                inner_height,
+                bottom_reached,
+                idle_rounds,
+                stable_rounds,
+            )
+
+        if idle_rounds >= stable_rounds:
             if debug:
                 LOGGER.debug(
-                    "stable-scroll round=%s selector=%s count=%s library_id_text_count=%s scroll_height=%s scroll_y=%s inner_height=%s bottom_reached=%s idle_rounds=%s/%s scroll_action=%s",
+                    "stable-scroll satisfied at round=%s count=%s library_id_text_count=%s scroll_height=%s",
                     idx + 1,
-                    selector,
                     count,
                     library_id_count,
                     scroll_height,
-                    scroll_y,
-                    inner_height,
-                    bottom_reached,
-                    idle_rounds,
-                    stable_rounds,
-                    scroll_action,
                 )
-                network_monitor.log_delta(phase="stable", round_index=idx + 1)
+            return
 
-            if idle_rounds >= stable_rounds:
-                if debug:
-                    LOGGER.debug(
-                        "stable-scroll satisfied at round=%s count=%s library_id_text_count=%s scroll_height=%s",
-                        idx + 1,
-                        count,
-                        library_id_count,
-                        scroll_height,
-                    )
-                return
-
-            prev_library_id_count = library_id_count
-            prev_scroll_height = scroll_height
-            prev_bottom_reached = bottom_reached
-            try:
-                await page.wait_for_timeout(wait_ms)
-            except Exception:
-                await asyncio.sleep(wait_ms / 1000)
-    finally:
-        network_monitor.log_summary(phase="stable")
-        network_monitor.detach()
+        prev_library_id_count = library_id_count
+        prev_scroll_height = scroll_height
+        try:
+            await page.wait_for_timeout(wait_ms)
+        except Exception:
+            await asyncio.sleep(wait_ms / 1000)
 
 
 async def _wait_until_min_library_ids(
@@ -1132,99 +1187,30 @@ async def _wait_until_min_library_ids(
     wait_ms: int,
     debug: bool,
 ) -> None:
-    prev_library_id_count = -1
-    prev_scroll_height = -1
-    prev_bottom_reached = False
-    stuck_rounds = 0
-    scroll_action = "none"
-    network_monitor = _NetworkDebugMonitor(page, enabled=debug and _network_debug_enabled())
-    network_monitor.attach()
-
-    try:
-        for idx in range(max_rounds):
-            try:
-                scroll_action = await _nudge_lazy_scroll(
-                    page,
-                    idx,
-                    stuck_rounds=stuck_rounds,
-                    bottom_reached=prev_bottom_reached,
-                )
-            except Exception:
-                scroll_action = "failed"
-
-            try:
-                metrics = await page.evaluate(
-                    r"""
-                    (sel) => {
-                      const text = document.body ? document.body.innerText : '';
-                      const matches = text.match(/(?:라이브러리\s*ID|Library\s+ID|Ad\s+library\s+ID)\s*:\s*\d+/gi);
-                      const scrollHeight = document.body ? document.body.scrollHeight : 0;
-                      const bottomReached = window.scrollY + window.innerHeight >= scrollHeight - 8;
-                      return {
-                        cardCount: document.querySelectorAll(sel).length,
-                        libraryIdCount: matches ? matches.length : 0,
-                        scrollHeight,
-                        bottomReached,
-                      };
-                    }
-                    """,
-                    AD_CARD_SELECTOR,
-                )
-            except Exception:
-                metrics = {
-                    "cardCount": -1,
-                    "libraryIdCount": -1,
-                    "scrollHeight": -1,
-                    "bottomReached": False,
-                }
-
-            library_id_count = int(metrics.get("libraryIdCount", -1))
-            card_count = int(metrics.get("cardCount", -1))
-            scroll_height = int(metrics.get("scrollHeight", -1))
-            bottom_reached = bool(metrics.get("bottomReached"))
-
-            if (
-                library_id_count == prev_library_id_count
-                and scroll_height == prev_scroll_height
-                and library_id_count > 0
-                and scroll_height >= 0
-                and bottom_reached
-            ):
-                stuck_rounds += 1
-            else:
-                stuck_rounds = 0
-
+    for idx in range(max_rounds):
+        library_id_count = await _count_library_ids_on_page(page)
+        card_count = await _count_dom_matches(page, AD_CARD_SELECTOR)
+        if debug:
+            LOGGER.debug(
+                "target-load round=%s scoped_card_selector_count=%s library_id_text_count=%s target=%s",
+                idx + 1,
+                card_count,
+                library_id_count,
+                target_count,
+            )
+        if library_id_count >= target_count:
             if debug:
                 LOGGER.debug(
-                    "target-load round=%s scoped_card_selector_count=%s library_id_text_count=%s target=%s scroll_height=%s bottom_reached=%s stuck_rounds=%s scroll_action=%s",
-                    idx + 1,
-                    card_count,
+                    "target-load satisfied library_id_text_count=%s target=%s",
                     library_id_count,
                     target_count,
-                    scroll_height,
-                    bottom_reached,
-                    stuck_rounds,
-                    scroll_action,
                 )
-                network_monitor.log_delta(phase="target", round_index=idx + 1)
-            if library_id_count >= target_count:
-                if debug:
-                    LOGGER.debug(
-                        "target-load satisfied library_id_text_count=%s target=%s",
-                        library_id_count,
-                        target_count,
-                    )
-                return
-            prev_library_id_count = library_id_count
-            prev_scroll_height = scroll_height
-            prev_bottom_reached = bottom_reached
-            try:
-                await page.wait_for_timeout(wait_ms)
-            except Exception:
-                await asyncio.sleep(wait_ms / 1000)
-    finally:
-        network_monitor.log_summary(phase="target")
-        network_monitor.detach()
+            return
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(wait_ms)
+        except Exception:
+            await asyncio.sleep(wait_ms / 1000)
 
 
 async def _mark_top_ad_cards(page: Any, *, limit: int, debug: bool) -> List[str]:
@@ -1417,9 +1403,7 @@ async def _fetch_advertiser_detail(
         "timeout": 120000,
         "max_pages": 1,
     }
-    proxy_url = _session_proxy_from_env()
-    if proxy_url:
-        session_config["proxy"] = proxy_url
+    _apply_session_env_options(session_config)
     async with AsyncStealthySession(**session_config) as session:
         return await _fetch_advertiser_detail_with_session(
             session,
@@ -1689,9 +1673,7 @@ async def crawl_meta_ads(
         "timeout": 120000,
         "max_pages": 1,
     }
-    proxy_url = _session_proxy_from_env()
-    if proxy_url:
-        session_config["proxy"] = proxy_url
+    _apply_session_env_options(session_config)
 
     if debug:
         LOGGER.debug("fetch url=%s filter_page_id(no-op)=%s", url, filter_page_id)
@@ -1777,9 +1759,7 @@ async def search_meta_advertisers(
         "timeout": 120000,
         "max_pages": 1,
     }
-    proxy_url = _session_proxy_from_env()
-    if proxy_url:
-        session_config["proxy"] = proxy_url
+    _apply_session_env_options(session_config)
 
     async with AsyncStealthySession(**session_config) as session:
         if debug:

@@ -22,7 +22,7 @@ from meta_ads_crawler import (
     build_ads_library_search_url, build_ads_library_url,
     _wait_until_min_library_ids, _wait_until_stable_cards, _collect_summary_popup_groups,
     _extract_html, _parse_ads_from_html, _merge_same_source_groups,
-    _session_proxy_from_env, AD_CARD_SELECTOR
+    _apply_session_env_options, _wait_for_ads_library_ready, AD_CARD_SELECTOR
 )
 
 LOGGER = logging.getLogger("spider-cron")
@@ -36,6 +36,13 @@ def _int_env(name: str, default: int) -> int:
     except ValueError:
         return default
 
+
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    if not value:
+        return default
+    return value not in {"0", "false", "no", "off"}
+
 class AdFungusSpider(Spider):
     name = "adfungus_cron_spider"
 
@@ -46,18 +53,19 @@ class AdFungusSpider(Spider):
         self.scroll_wait_ms = max(_int_env("SCROLL_WAIT_MS", 1200), 300)
         self.stable_rounds = max(_int_env("STABLE_ROUNDS", 3), 1)
         self.stable_max_rounds = max(_int_env("STABLE_MAX_ROUNDS", 100), 1) # Set high for full collection
+        self.challenge_wait_ms = max(_int_env("CHALLENGE_WAIT_MS", 90000), 0)
         self.debug = os.getenv("DEBUG", "").lower() in {"1", "true", "yes"}
 
     def configure_sessions(self, manager):
         session_config = {
-            "headless": True,
+            "headless": _bool_env("HEADLESS", True),
             "real_chrome": os.getenv("META_ADS_REAL_CHROME", "true").lower() not in {"0", "false", "no"},
             "timeout": 120000,
             "max_pages": 4,
+            "retries": max(_int_env("FETCH_RETRIES", 1), 1),
+            "retry_delay": max(_int_env("FETCH_RETRY_DELAY_MS", 1000), 0),
         }
-        proxy_url = _session_proxy_from_env()
-        if proxy_url:
-            session_config["proxy"] = proxy_url
+        _apply_session_env_options(session_config)
         manager.add("stealth_session", AsyncStealthySession(**session_config))
 
     async def start_requests(self):
@@ -76,6 +84,15 @@ class AdFungusSpider(Spider):
             def make_page_action(limit_val, stable_max_rounds_val, scroll_wait_ms_val, stable_rounds_val, debug_val):
                 popup_groups = []
                 async def page_action(page: Any) -> None:
+                    ready_state = await _wait_for_ads_library_ready(
+                        page,
+                        max_wait_ms=self.challenge_wait_ms,
+                        debug=debug_val,
+                    )
+                    if not ready_state.get("ready"):
+                        if debug_val:
+                            LOGGER.debug("ads-library-not-ready skip_scroll state=%s", ready_state)
+                        return
                     await page.wait_for_timeout(3000)
                     if limit_val > 0:
                         await _wait_until_min_library_ids(page, target_count=limit_val, max_rounds=stable_max_rounds_val, wait_ms=scroll_wait_ms_val, debug=debug_val)
@@ -109,7 +126,7 @@ class AdFungusSpider(Spider):
                 },
                 page_action=page_action,
                 timeout=120000,
-                network_idle=True
+                network_idle=False
             )
 
     async def parse(self, response):

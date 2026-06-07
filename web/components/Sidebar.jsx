@@ -138,7 +138,7 @@ export default function Sidebar({
           <input 
             type="checkbox" 
             checked={selectedFilterBrands.has(c.id)} 
-            readOnly 
+            onChange={() => onToggleFilterBrand(c.id)}
             onClick={(e) => e.stopPropagation()}
           />
           {c.brand_logo_url ? <img className="small-logo" src={c.brand_logo_url} alt="" /> : <div className="small-logo" />}
