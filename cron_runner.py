@@ -25,6 +25,7 @@ from meta_ads_crawler import (
     build_ads_library_search_url,
     build_ads_library_url,
     crawl_meta_ads,
+    fill_missing_influencer_instagram_usernames,
 )
 
 
@@ -71,6 +72,7 @@ CREATE TABLE IF NOT EXISTS meta_ads (
     active BOOLEAN,
     platforms JSONB NOT NULL DEFAULT '[]'::jsonb,
     body TEXT,
+    influencer_instagram_username TEXT,
     link_title TEXT,
     link_url TEXT,
     link_description TEXT,
@@ -98,12 +100,15 @@ ALTER TABLE meta_ads ADD COLUMN IF NOT EXISTS competitor_id BIGINT;
 ALTER TABLE meta_ads ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'running';
 ALTER TABLE meta_ads ADD COLUMN IF NOT EXISTS missing_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE meta_ads ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ;
+ALTER TABLE meta_ads ADD COLUMN IF NOT EXISTS influencer_instagram_username TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_meta_ads_page_id ON meta_ads(page_id);
 CREATE INDEX IF NOT EXISTS idx_meta_ads_brand ON meta_ads(brand);
 CREATE INDEX IF NOT EXISTS idx_meta_ads_last_seen_at ON meta_ads(last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_meta_ads_status ON meta_ads(status);
 CREATE INDEX IF NOT EXISTS idx_meta_ads_start_date ON meta_ads(start_date);
+CREATE INDEX IF NOT EXISTS idx_meta_ads_influencer_instagram_username
+    ON meta_ads(influencer_instagram_username);
 
 CREATE TABLE IF NOT EXISTS app_users (
     id BIGSERIAL PRIMARY KEY,
@@ -253,6 +258,31 @@ CREATE TABLE IF NOT EXISTS meta_ad_observations (
 CREATE INDEX IF NOT EXISTS idx_meta_ad_observations_library_id ON meta_ad_observations(library_id);
 CREATE INDEX IF NOT EXISTS idx_meta_ad_observations_run_id ON meta_ad_observations(run_id);
 CREATE INDEX IF NOT EXISTS idx_meta_ad_observations_observed_at ON meta_ad_observations(observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS meta_ad_instagram_metric_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    library_id TEXT REFERENCES meta_ads(library_id) ON DELETE CASCADE,
+    run_id BIGINT REFERENCES ad_crawl_runs(id) ON DELETE SET NULL,
+    influencer_instagram_username TEXT NOT NULL,
+    instagram_media_id TEXT,
+    permalink TEXT,
+    caption TEXT,
+    media_type TEXT,
+    instagram_timestamp TIMESTAMPTZ,
+    like_count INTEGER,
+    comments_count INTEGER,
+    view_count INTEGER,
+    match_status TEXT NOT NULL CHECK (match_status IN ('matched', 'no_username', 'no_match', 'api_error')),
+    match_score DOUBLE PRECISION,
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_meta_ad_instagram_metric_snapshots_run_library_username
+    ON meta_ad_instagram_metric_snapshots(run_id, library_id, influencer_instagram_username);
+CREATE INDEX IF NOT EXISTS idx_meta_ad_instagram_metric_snapshots_library_created
+    ON meta_ad_instagram_metric_snapshots(library_id, created_at DESC);
 """
 
 
@@ -621,6 +651,20 @@ def _split_ads_by_existing(
     return existing_ads, new_ads
 
 
+def _fill_new_ad_influencer_instagram_usernames(ads: List[Dict[str, Any]]) -> Dict[str, str]:
+    if not ads:
+        return {}
+    return asyncio.run(
+        fill_missing_influencer_instagram_usernames(
+            ads,
+            country=os.getenv("META_ADS_SEARCH_COUNTRY", "KR"),
+            limit=max(_int_env("INFLUENCER_TYPEAHEAD_LIMIT", 10), 1),
+            scroll_wait_ms=max(_int_env("SCROLL_WAIT_MS", 1200), 300),
+            debug=os.getenv("DEBUG", "").lower() in {"1", "true", "yes"},
+        )
+    )
+
+
 def _store_existing_ad_observations(
     conn: psycopg.Connection[Any],
     *,
@@ -643,6 +687,7 @@ def _store_existing_ad_observations(
                 """
                 UPDATE meta_ads
                 SET last_seen_run_id = %s,
+                    influencer_instagram_username = COALESCE(NULLIF(%s, ''), influencer_instagram_username),
                     status = 'running',
                     missing_count = 0,
                     ended_at = NULL,
@@ -650,7 +695,7 @@ def _store_existing_ad_observations(
                     updated_at = now()
                 WHERE library_id = %s
                 """,
-                (run_id, library_id),
+                (run_id, str(ad.get("influencerInstagramUsername") or "").strip(), library_id),
             )
 
             cur.execute(
@@ -713,14 +758,14 @@ def _store_ads(
                 """
                 INSERT INTO meta_ads (
                     library_id, first_seen_run_id, last_seen_run_id, page_id,
-                    brand, brand_logo_url, active, platforms, body,
+                    brand, brand_logo_url, active, platforms, body, influencer_instagram_username,
                     link_title, link_url, link_description, cta_text, cta_url,
                     start_date_text, start_date, ad_format, same_source_library_ids,
                     meta_library_url, competitor_id, status, missing_count, ended_at, raw_json
                 )
                 VALUES (
                     %(library_id)s, %(run_id)s, %(run_id)s, %(page_id)s,
-                    %(brand)s, %(brand_logo_url)s, %(active)s, %(platforms)s, %(body)s,
+                    %(brand)s, %(brand_logo_url)s, %(active)s, %(platforms)s, %(body)s, %(influencer_instagram_username)s,
                     %(link_title)s, %(link_url)s, %(link_description)s, %(cta_text)s, %(cta_url)s,
                     %(start_date_text)s, %(start_date)s, %(ad_format)s, %(same_source_library_ids)s,
                     %(meta_library_url)s, %(competitor_id)s, 'running', 0, NULL, %(raw_json)s
@@ -733,6 +778,7 @@ def _store_ads(
                     active = EXCLUDED.active,
                     platforms = EXCLUDED.platforms,
                     body = EXCLUDED.body,
+                    influencer_instagram_username = EXCLUDED.influencer_instagram_username,
                     link_title = EXCLUDED.link_title,
                     link_url = EXCLUDED.link_url,
                     link_description = EXCLUDED.link_description,
@@ -760,6 +806,7 @@ def _store_ads(
                     "active": ad.get("active"),
                     "platforms": Jsonb(ad.get("platforms") or []),
                     "body": ad.get("body"),
+                    "influencer_instagram_username": str(ad.get("influencerInstagramUsername") or "").strip() or None,
                     "link_title": ad.get("linkTitle"),
                     "link_url": ad.get("linkUrl"),
                     "link_description": ad.get("linkDescription"),
@@ -885,6 +932,7 @@ def _expand_versions_globally(database_url: str) -> None:
                     cur.execute("""
                         INSERT INTO meta_ads (
                             library_id, page_id, brand, brand_logo_url, active, platforms, body,
+                            influencer_instagram_username,
                             link_title, link_url, link_description, cta_text, cta_url,
                             start_date_text, start_date, ad_format, same_source_library_ids,
                             meta_library_url, competitor_id, status, raw_json,
@@ -892,6 +940,7 @@ def _expand_versions_globally(database_url: str) -> None:
                         )
                         SELECT 
                             %s, page_id, brand, brand_logo_url, active, platforms, body,
+                            influencer_instagram_username,
                             link_title, link_url, link_description, cta_text, cta_url,
                             %s, NULL, ad_format, same_source_library_ids,
                             NULL, competitor_id, status, raw_json,
@@ -1033,6 +1082,28 @@ def _process_embeddings_after_crawl(database_url: str, library_ids: List[str] | 
     LOGGER.info("ad embedding after crawl embedded=%s scored=%s", embedded, scored)
 
 
+def _process_instagram_metrics_after_crawl(
+    database_url: str,
+    run_id: int,
+    library_ids: List[str] | None = None,
+) -> None:
+    if not os.getenv("PAGE_ACCESS_TOKEN", "").strip():
+        LOGGER.warning("instagram metrics skipped because PAGE_ACCESS_TOKEN is missing")
+        return
+    if not library_ids:
+        LOGGER.info("instagram metrics skipped because no library_ids were observed")
+        return
+
+    from instagram_metrics_worker import process_instagram_metrics
+
+    result = process_instagram_metrics(
+        database_url=database_url,
+        run_id=run_id,
+        library_ids=library_ids,
+    )
+    LOGGER.info("instagram metrics after crawl result=%s", result)
+
+
 async def _crawl() -> tuple[str, str, List[Dict[str, Any]]]:
     page_id = os.getenv("PAGE_ID", DEFAULT_PAGE_ID).strip() or DEFAULT_PAGE_ID
     library_url = build_ads_library_url(page_id)
@@ -1093,6 +1164,13 @@ def sync_competitor(competitor_id: int) -> int:
         with psycopg.connect(database_url) as conn:
             existing_library_ids = _existing_library_ids(conn, observed_library_ids)
         existing_ads, new_ads = _split_ads_by_existing(ads, existing_library_ids)
+        fallback_matches = _fill_new_ad_influencer_instagram_usernames(new_ads)
+        if fallback_matches:
+            LOGGER.info(
+                "influencer fallback filled %s new ads for competitor_id=%s",
+                len(fallback_matches),
+                competitor_id,
+            )
         prepared_new_ads = _prepare_media_for_storage(new_ads)
         LOGGER.info(
             "crawl split competitor_id=%s observed=%s existing=%s new=%s",
@@ -1159,6 +1237,11 @@ def sync_competitor(competitor_id: int) -> int:
             return 0
 
     # Phase 3: Post-crawl processing (Independent Tasks)
+    try:
+        _process_instagram_metrics_after_crawl(database_url, run_id, observed_library_ids)
+    except Exception:
+        LOGGER.exception("instagram metrics failed for competitor_id=%s", competitor_id)
+
     if new_library_ids:
         try:
             _process_videos_after_crawl(database_url, new_library_ids)
@@ -1202,6 +1285,9 @@ def main() -> int:
                 existing_library_ids = _existing_library_ids(conn, observed_library_ids)
                 conn.commit()
                 existing_ads, new_ads = _split_ads_by_existing(ads, existing_library_ids)
+                fallback_matches = _fill_new_ad_influencer_instagram_usernames(new_ads)
+                if fallback_matches:
+                    LOGGER.info("influencer fallback filled %s new ads", len(fallback_matches))
                 prepared_new_ads = _prepare_media_for_storage(new_ads)
                 existing_stored, _ = _store_existing_ad_observations(
                     conn,
@@ -1217,6 +1303,7 @@ def main() -> int:
                 stored = existing_stored + new_stored
                 _finish_run(conn, run_id, status="success", ad_count=stored)
                 conn.commit()
+                _process_instagram_metrics_after_crawl(database_url, run_id, observed_library_ids)
                 if new_library_ids:
                     _process_videos_after_crawl(database_url, new_library_ids)
                     _process_embeddings_after_crawl(database_url, new_library_ids)

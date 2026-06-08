@@ -14,8 +14,10 @@ from scrapling.fetchers import AsyncStealthySession
 from cron_runner import (
     _setup_logging, _database_url, _monitoring_competitors, _create_run,
     _library_ids_from_ads, _existing_library_ids, _split_ads_by_existing,
-    _prepare_media_for_storage, _store_existing_ad_observations, _store_ads,
-    _mark_missing_ads, _finish_run, _process_videos_after_crawl, _process_embeddings_after_crawl,
+    _fill_new_ad_influencer_instagram_usernames, _prepare_media_for_storage,
+    _store_existing_ad_observations, _store_ads,
+    _mark_missing_ads, _finish_run, _process_instagram_metrics_after_crawl,
+    _process_videos_after_crawl, _process_embeddings_after_crawl,
     SCHEMA_SQL, _ensure_default_workspace, _load_local_env
 )
 from meta_ads_crawler import (
@@ -166,6 +168,13 @@ class AdFungusSpider(Spider):
             with psycopg.connect(self.database_url) as conn:
                 existing_library_ids = _existing_library_ids(conn, observed_library_ids)
             existing_ads, new_ads = _split_ads_by_existing(ads, existing_library_ids)
+            fallback_matches = _fill_new_ad_influencer_instagram_usernames(new_ads)
+            if fallback_matches:
+                LOGGER.info(
+                    "influencer fallback filled %s new ads for competitor_id=%s",
+                    len(fallback_matches),
+                    competitor_id,
+                )
             prepared_new_ads = _prepare_media_for_storage(new_ads)
             LOGGER.info(
                 f"crawl split competitor_id={competitor_id} observed={len(observed_library_ids)} existing={len(existing_ads)} new={len(prepared_new_ads)}"
@@ -217,6 +226,15 @@ class AdFungusSpider(Spider):
                 return
 
         # Phase 3: Post-crawl processing (Independent Tasks)
+        try:
+            _process_instagram_metrics_after_crawl(
+                self.database_url,
+                run_id,
+                observed_library_ids,
+            )
+        except Exception:
+            LOGGER.exception(f"instagram metrics failed for competitor_id={competitor_id}")
+
         if new_library_ids:
             try:
                 _process_videos_after_crawl(self.database_url, new_library_ids)

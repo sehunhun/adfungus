@@ -430,6 +430,13 @@ def state(
                 a.start_date, a.ad_format, a.same_source_library_ids, a.meta_library_url,
                 wa.first_seen_at, wa.last_seen_at, wa.ended_at,
                 a.similar_count, a.similar_library_ids,
+                a.influencer_instagram_username,
+                ig.like_count AS instagram_like_count,
+                ig.comments_count AS instagram_comments_count,
+                ig.view_count AS instagram_view_count,
+                ig.match_status AS instagram_metrics_status,
+                ig.created_at AS instagram_metrics_matched_at,
+                ig.permalink AS instagram_permalink,
                 EXISTS (
                     SELECT 1 FROM saved_ads s
                     WHERE s.workspace_id = %s AND s.library_id = a.library_id
@@ -460,6 +467,13 @@ def state(
                 ORDER BY id ASC
                 LIMIT 1
             ) i ON true
+            LEFT JOIN LATERAL (
+                SELECT like_count, comments_count, view_count, match_status, created_at, permalink
+                FROM meta_ad_instagram_metric_snapshots
+                WHERE library_id = a.library_id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) ig ON true
             WHERE {where_clause}
             ORDER BY {order_clause}
         """
@@ -822,6 +836,12 @@ def get_ad_detail(library_id: str, request: Request) -> dict[str, Any]:
             SELECT 
                 a.*,
                 wa.status as workspace_status,
+                ig.like_count AS instagram_like_count,
+                ig.comments_count AS instagram_comments_count,
+                ig.view_count AS instagram_view_count,
+                ig.match_status AS instagram_metrics_status,
+                ig.created_at AS instagram_metrics_matched_at,
+                ig.permalink AS instagram_permalink,
                 EXISTS (
                     SELECT 1 FROM saved_ads s
                     WHERE s.workspace_id = %s AND s.library_id = a.library_id
@@ -844,6 +864,13 @@ def get_ad_detail(library_id: str, request: Request) -> dict[str, Any]:
                 ORDER BY id ASC
                 LIMIT 1
             ) i ON true
+            LEFT JOIN LATERAL (
+                SELECT like_count, comments_count, view_count, match_status, created_at, permalink
+                FROM meta_ad_instagram_metric_snapshots
+                WHERE library_id = a.library_id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) ig ON true
             WHERE a.library_id = %s OR a.library_id = TRIM(%s)
             """,
             (workspace_id, workspace_id, library_id, library_id),

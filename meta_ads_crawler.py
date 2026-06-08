@@ -169,17 +169,28 @@ def _extract_instagram_username_from_href(href: str) -> str:
     return username
 
 
-def _parse_influencer_instagram_username(card: Any) -> str:
+def _parse_influencer_context(card: Any) -> Dict[str, Any]:
     anchors = list(card.css("a[href]"))
-    if len(anchors) < 2:
-        return ""
+    has_context = len(anchors) >= 2
+    display_name = ""
+    username = ""
 
-    for anchor in anchors:
-        href = (getattr(anchor, "attrib", {}) or {}).get("href", "")
+    if has_context:
+        first_anchor = anchors[0]
+        first_span = first_anchor.css("span").first
+        display_name = _node_text(first_span)
+        href = (getattr(first_anchor, "attrib", {}) or {}).get("href", "")
         username = _extract_instagram_username_from_href(href)
-        if username:
-            return username
-    return ""
+
+    return {
+        "hasInfluencerContext": has_context,
+        "influencerDisplayName": display_name,
+        "influencerInstagramUsername": username,
+    }
+
+
+def _parse_influencer_instagram_username(card: Any) -> str:
+    return str(_parse_influencer_context(card).get("influencerInstagramUsername") or "")
 
 
 def _parse_library_id(card_text: str) -> str:
@@ -504,7 +515,7 @@ def parse_ad_card(card: Any) -> Optional[Dict[str, Any]]:
     links = _parse_cta_and_link(card)
     brand_data = _parse_brand(card)
     body = _parse_body_text(card)
-    influencer_instagram_username = _parse_influencer_instagram_username(card)
+    influencer_context = _parse_influencer_context(card)
 
     active = "활성" in card_text or bool(
         re.search(r"\bActive\b", card_text, flags=re.IGNORECASE)
@@ -531,7 +542,9 @@ def parse_ad_card(card: Any) -> Optional[Dict[str, Any]]:
         "active": active,
         "platforms": platforms,
         "body": body,
-        "influencerInstagramUsername": influencer_instagram_username,
+        "hasInfluencerContext": influencer_context["hasInfluencerContext"],
+        "influencerDisplayName": influencer_context["influencerDisplayName"],
+        "influencerInstagramUsername": influencer_context["influencerInstagramUsername"],
         "linkTitle": links["linkTitle"],
         "linkUrl": links["linkUrl"],
         "linkDescription": links["linkDescription"],
@@ -1402,6 +1415,36 @@ def _parse_advertiser_info_text(text: str) -> Dict[str, str]:
     }
 
 
+def _candidate_instagram_username(candidate: Dict[str, Any]) -> str:
+    handle = _clean(candidate.get("instagram_handle")).strip("@")
+    if _INSTAGRAM_USERNAME_RE.fullmatch(handle):
+        return handle
+    return ""
+
+
+def _select_exact_influencer_typeahead_candidate(
+    display_name: str,
+    candidates: List[Dict[str, Any]],
+) -> Dict[str, Any] | None:
+    target = _normalize_brand_key(display_name)
+    if not target:
+        return None
+
+    for candidate in candidates:
+        candidate_name = _clean(candidate.get("brand"))
+        if candidate_name and _normalize_brand_key(candidate_name) == target:
+            return candidate
+    return None
+
+
+def _ad_needs_influencer_username_fallback(ad: Dict[str, Any]) -> bool:
+    return (
+        bool(ad.get("hasInfluencerContext"))
+        and not _clean(ad.get("influencerInstagramUsername"))
+        and bool(_clean(ad.get("influencerDisplayName")))
+    )
+
+
 def _group_advertiser_candidates(ads: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
     grouped: Dict[str, Dict[str, Any]] = {}
     for ad in ads:
@@ -1917,6 +1960,260 @@ async def search_meta_advertisers(
         results[0]["_timings"] = timings
         
     return results
+
+
+async def search_influencer_typeahead_candidates(
+    display_name: str,
+    *,
+    country: str = "KR",
+    limit: int = 10,
+    scroll_wait_ms: int = 1200,
+    debug: bool = False,
+) -> List[Dict[str, Any]]:
+    query = _clean(display_name)
+    if not query:
+        return []
+
+    StealthyFetcher.configure(adaptive=True)
+    url = build_ads_library_search_url("", country=country)
+    results: List[Dict[str, Any]] = []
+
+    session_config: Dict[str, Any] = {
+        "headless": True,
+        "real_chrome": os.getenv("META_ADS_REAL_CHROME", "true").lower()
+        not in {"0", "false", "no"},
+        "timeout": 120000,
+        "max_pages": 1,
+    }
+    _apply_session_env_options(session_config)
+
+    async with AsyncStealthySession(**session_config) as session:
+        async def page_action(page: Any) -> None:
+            await page.wait_for_timeout(3000)
+            await _close_ads_library_overlays(page)
+            results.extend(
+                await _read_influencer_typeahead_candidates_from_page(
+                    page,
+                    query,
+                    limit=limit,
+                    scroll_wait_ms=scroll_wait_ms,
+                    debug=debug,
+                )
+            )
+
+        try:
+            await session.fetch(
+                url,
+                page_action=page_action,
+                timeout=120000,
+                network_idle=True,
+                wait_selector='input[type="search"]',
+                wait_selector_state="visible",
+            )
+        except Exception as exc:
+            LOGGER.warning("influencer fallback typeahead failed display_name=%r error=%s", query, exc)
+
+    return results
+
+
+async def _close_ads_library_overlays(page: Any) -> None:
+    try:
+        overlay_selectors = [
+            '[aria-label="닫기"]',
+            '[aria-label="Close"]',
+            'button:has-text("모두 허용")',
+            'button:has-text("Allow all cookies")',
+        ]
+        for sel in overlay_selectors:
+            overlay = page.locator(sel).first
+            if await overlay.count() > 0:
+                await overlay.click(timeout=2000)
+    except Exception:
+        pass
+
+
+async def _ads_library_search_input(page: Any) -> Any | None:
+    search_input = page.locator(
+        'input[type="search"][placeholder*="검색"], input[type="search"][placeholder*="Search"]'
+    ).first
+    if await search_input.count() > 0:
+        return search_input
+
+    search_input = page.locator(
+        'input[placeholder*="광고주"], input[placeholder*="advertiser"]'
+    ).first
+    if await search_input.count() > 0:
+        return search_input
+    return None
+
+
+async def _read_influencer_typeahead_candidates_from_page(
+    page: Any,
+    display_name: str,
+    *,
+    limit: int,
+    scroll_wait_ms: int,
+    debug: bool,
+) -> List[Dict[str, Any]]:
+    query = _clean(display_name)
+    if not query:
+        return []
+
+    search_input = await _ads_library_search_input(page)
+    if search_input is None:
+        LOGGER.warning("influencer fallback search input not found display_name=%r", query)
+        return []
+
+    await search_input.scroll_into_view_if_needed()
+    await search_input.click(force=True, timeout=5000)
+    await search_input.fill("", timeout=5000)
+    await page.wait_for_timeout(250)
+    await search_input.fill(query, timeout=5000)
+    await page.wait_for_timeout(scroll_wait_ms)
+
+    candidates: List[Dict[str, Any]] = []
+    advertiser_options = page.locator('li[id^="pageID:"]')
+    count = await advertiser_options.count()
+    if debug:
+        LOGGER.info(
+            "influencer fallback typeahead display_name=%r candidates=%s",
+            query,
+            count,
+        )
+
+    for i in range(min(count, limit)):
+        option = advertiser_options.nth(i)
+        try:
+            html = await option.inner_html()
+            option_id = await option.get_attribute("id") or ""
+            page_id = option_id.replace("pageID:", "").strip()
+
+            doc = Selector(html)
+            brand = _node_text(doc.css('[role="heading"]').first)
+            logo_node = doc.css("img").first
+            logo = ""
+            if logo_node:
+                logo = _clean(logo_node.attrib.get("src", ""))
+
+            info = _parse_advertiser_info_text(_node_text(doc))
+            candidates.append(
+                {
+                    "page_id": page_id,
+                    "brand": brand or info.get("instagram_handle") or f"Page {page_id}",
+                    "brand_logo_url": logo,
+                    "facebook_followers_text": info.get("facebook_followers_text"),
+                    "instagram_handle": info.get("instagram_handle"),
+                    "instagram_followers_text": info.get("instagram_followers_text"),
+                    "source": "influencer_typeahead",
+                    "matched_ads_count": 0,
+                }
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "influencer fallback candidate parse failed display_name=%r index=%s error=%s",
+                query,
+                i,
+                exc,
+            )
+    return candidates
+
+
+async def fill_missing_influencer_instagram_usernames(
+    ads: List[Dict[str, Any]],
+    *,
+    country: str = "KR",
+    limit: int = 10,
+    scroll_wait_ms: int = 1200,
+    debug: bool = False,
+) -> Dict[str, str]:
+    display_names_by_key: Dict[str, str] = {}
+    filled: Dict[str, str] = {}
+
+    for ad in ads:
+        if not _ad_needs_influencer_username_fallback(ad):
+            continue
+
+        display_name = _clean(ad.get("influencerDisplayName"))
+        cache_key = _normalize_brand_key(display_name)
+        if cache_key and cache_key not in display_names_by_key:
+            display_names_by_key[cache_key] = display_name
+
+    if not display_names_by_key:
+        return {}
+
+    cache: Dict[str, str] = {key: "" for key in display_names_by_key}
+
+    StealthyFetcher.configure(adaptive=True)
+    url = build_ads_library_search_url("", country=country)
+    session_config: Dict[str, Any] = {
+        "headless": True,
+        "real_chrome": os.getenv("META_ADS_REAL_CHROME", "true").lower()
+        not in {"0", "false", "no"},
+        "timeout": 120000,
+        "max_pages": 1,
+    }
+    _apply_session_env_options(session_config)
+
+    async with AsyncStealthySession(**session_config) as session:
+        async def page_action(page: Any) -> None:
+            await page.wait_for_timeout(3000)
+            await _close_ads_library_overlays(page)
+
+            for cache_key, display_name in display_names_by_key.items():
+                username = ""
+                try:
+                    candidates = await _read_influencer_typeahead_candidates_from_page(
+                        page,
+                        display_name,
+                        limit=limit,
+                        scroll_wait_ms=scroll_wait_ms,
+                        debug=debug,
+                    )
+                    selected = _select_exact_influencer_typeahead_candidate(display_name, candidates)
+                    if selected:
+                        username = _candidate_instagram_username(selected)
+                except Exception as exc:
+                    LOGGER.warning(
+                        "influencer fallback skipped display_name=%r error=%s",
+                        display_name,
+                        exc,
+                    )
+                if username:
+                    LOGGER.info(
+                        "influencer fallback matched display_name=%r username=%s",
+                        display_name,
+                        username,
+                    )
+                else:
+                    LOGGER.info("influencer fallback no exact match display_name=%r", display_name)
+                cache[cache_key] = username
+
+        try:
+            await session.fetch(
+                url,
+                page_action=page_action,
+                timeout=120000,
+                network_idle=True,
+                wait_selector='input[type="search"]',
+                wait_selector_state="visible",
+            )
+        except Exception as exc:
+            LOGGER.warning("influencer fallback session failed error=%s", exc)
+
+    for ad in ads:
+        if not _ad_needs_influencer_username_fallback(ad):
+            continue
+
+        display_name = _clean(ad.get("influencerDisplayName"))
+        cache_key = _normalize_brand_key(display_name)
+        username = cache.get(cache_key, "")
+        if username:
+            ad["influencerInstagramUsername"] = username
+            library_id = _clean(ad.get("libraryID"))
+            if library_id:
+                filled[library_id] = username
+
+    return filled
 
 
 def main() -> None:
