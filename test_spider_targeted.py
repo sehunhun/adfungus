@@ -34,7 +34,7 @@ from meta_ads_crawler import (
 LOGGER = logging.getLogger("spider-targeted")
 
 # 타겟팅할 브랜드의 competitor ID 목록
-TARGET_IDS = [98]  # [90, 79, 80, 88, 89, 82, 84, 85, 87, 91, 92, 86, 93]
+TARGET_IDS = [97]  # [90, 79, 80, 88, 89, 82, 84, 85, 87, 91, 92, 86, 93]
 
 
 class TargetedAdFungusSpider(AdFungusSpider):

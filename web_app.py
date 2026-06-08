@@ -319,7 +319,8 @@ def state(
     sort_by: str = "newest", 
     status: str = "all",
     limit: int = 1000,
-    offset: int = 0
+    offset: int = 0,
+    competitor_ids: str = "",
 ) -> dict[str, Any]:
     trace_id = _trace_id(request)
     request_started_at = time.perf_counter()
@@ -412,6 +413,14 @@ def state(
         if status in ("running", "ended"):
             where_clause += " AND wa.status = %s"
             params.append(status)
+        selected_competitor_ids = [
+            int(value)
+            for value in competitor_ids.split(",")
+            if value.strip().isdigit()
+        ]
+        if selected_competitor_ids:
+            where_clause += " AND wa.competitor_id = ANY(%s)"
+            params.append(selected_competitor_ids)
 
         # 공통 쿼리 베이스 정의
         query_base = f"""

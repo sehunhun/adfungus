@@ -145,6 +145,43 @@ def _normalize_outbound_url(url: str) -> str:
     return raw
 
 
+_INSTAGRAM_USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+
+
+def _extract_instagram_username_from_href(href: str) -> str:
+    normalized = _normalize_outbound_url(href)
+    if not normalized:
+        return ""
+
+    parsed = urlparse(normalized)
+    host = parsed.netloc.lower().removeprefix("www.")
+    if host != "instagram.com":
+        return ""
+
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if not parts:
+        return ""
+
+    username = parts[1] if len(parts) >= 2 and parts[0] == "_u" else parts[0]
+    username = _clean(username).strip("@")
+    if not _INSTAGRAM_USERNAME_RE.fullmatch(username):
+        return ""
+    return username
+
+
+def _parse_influencer_instagram_username(card: Any) -> str:
+    anchors = list(card.css("a[href]"))
+    if len(anchors) < 2:
+        return ""
+
+    for anchor in anchors:
+        href = (getattr(anchor, "attrib", {}) or {}).get("href", "")
+        username = _extract_instagram_username_from_href(href)
+        if username:
+            return username
+    return ""
+
+
 def _parse_library_id(card_text: str) -> str:
     match = LIBRARY_ID_RE.search(card_text)
     return match.group(1) if match else ""
@@ -467,6 +504,7 @@ def parse_ad_card(card: Any) -> Optional[Dict[str, Any]]:
     links = _parse_cta_and_link(card)
     brand_data = _parse_brand(card)
     body = _parse_body_text(card)
+    influencer_instagram_username = _parse_influencer_instagram_username(card)
 
     active = "활성" in card_text or bool(
         re.search(r"\bActive\b", card_text, flags=re.IGNORECASE)
@@ -493,6 +531,7 @@ def parse_ad_card(card: Any) -> Optional[Dict[str, Any]]:
         "active": active,
         "platforms": platforms,
         "body": body,
+        "influencerInstagramUsername": influencer_instagram_username,
         "linkTitle": links["linkTitle"],
         "linkUrl": links["linkUrl"],
         "linkDescription": links["linkDescription"],
