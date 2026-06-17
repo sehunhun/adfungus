@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from typing import Any
 
 import psycopg
@@ -11,12 +12,13 @@ from psycopg.rows import dict_row
 from scrapling.spiders import Spider, Request
 from scrapling.fetchers import AsyncStealthySession
 
-from cron_runner import (
+from cron_runner_old import (
     _setup_logging, _database_url, _monitoring_competitors, _create_run,
     _library_ids_from_ads, _existing_library_ids, _split_ads_by_existing,
+    _existing_influencer_instagram_usernames, _fallback_target_ads,
     _fill_new_ad_influencer_instagram_usernames, _prepare_media_for_storage,
     _store_existing_ad_observations, _store_ads,
-    _mark_missing_ads, _finish_run, _process_instagram_metrics_after_crawl,
+    _mark_missing_ads, _finish_run,
     _process_videos_after_crawl, _process_embeddings_after_crawl,
     SCHEMA_SQL, _ensure_default_workspace, _load_local_env
 )
@@ -48,11 +50,13 @@ def _bool_env(name: str, default: bool) -> bool:
 class AdFungusSpider(Spider):
     name = "adfungus_cron_spider"
 
-    def __init__(self, database_url: str, *args, **kwargs):
+    def __init__(self, database_url: str, *args, run_gemini: bool = True, job_id: str | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.database_url = database_url
+        self.run_gemini = run_gemini
+        self.job_id = (job_id or uuid.uuid4().hex).strip()
         self.limit = max(_int_env("LIMIT", 0), 0)
-        self.scroll_wait_ms = max(_int_env("SCROLL_WAIT_MS", 1200), 300)
+        self.scroll_wait_ms = max(_int_env("SCROLL_WAIT_MS", 3000), 300)
         self.stable_rounds = max(_int_env("STABLE_ROUNDS", 3), 1)
         self.stable_max_rounds = max(_int_env("STABLE_MAX_ROUNDS", 100), 1) # Set high for full collection
         self.challenge_wait_ms = max(_int_env("CHALLENGE_WAIT_MS", 90000), 0)
@@ -95,7 +99,7 @@ class AdFungusSpider(Spider):
                         if debug_val:
                             LOGGER.debug("ads-library-not-ready skip_scroll state=%s", ready_state)
                         return
-                    await page.wait_for_timeout(3000)
+                    await page.wait_for_timeout(10000)
                     if limit_val > 0:
                         await _wait_until_min_library_ids(page, target_count=limit_val, max_rounds=stable_max_rounds_val, wait_ms=scroll_wait_ms_val, debug=debug_val)
                     else:
@@ -112,7 +116,14 @@ class AdFungusSpider(Spider):
             LOGGER.info(f"[*] Queuing request for {brand} (ID: {competitor_id})")
             
             with psycopg.connect(self.database_url, autocommit=False) as conn:
-                run_id = _create_run(conn, page_id, target_url, workspace_id=workspace_id, competitor_id=competitor_id)
+                run_id = _create_run(
+                    conn,
+                    page_id,
+                    target_url,
+                    job_id=self.job_id,
+                    workspace_id=workspace_id,
+                    competitor_id=competitor_id,
+                )
                 conn.commit()
 
             yield Request(
@@ -167,13 +178,16 @@ class AdFungusSpider(Spider):
             observed_library_ids = _library_ids_from_ads(ads)
             with psycopg.connect(self.database_url) as conn:
                 existing_library_ids = _existing_library_ids(conn, observed_library_ids)
+                existing_usernames = _existing_influencer_instagram_usernames(conn, observed_library_ids)
             existing_ads, new_ads = _split_ads_by_existing(ads, existing_library_ids)
-            fallback_matches = _fill_new_ad_influencer_instagram_usernames(new_ads)
+            fallback_ads = _fallback_target_ads(new_ads, existing_ads, existing_usernames)
+            fallback_matches = _fill_new_ad_influencer_instagram_usernames(fallback_ads)
             if fallback_matches:
                 LOGGER.info(
-                    "influencer fallback filled %s new ads for competitor_id=%s",
+                    "influencer fallback filled %s ads for competitor_id=%s targets=%s",
                     len(fallback_matches),
                     competitor_id,
+                    len(fallback_ads),
                 )
             prepared_new_ads = _prepare_media_for_storage(new_ads)
             LOGGER.info(
@@ -226,16 +240,13 @@ class AdFungusSpider(Spider):
                 return
 
         # Phase 3: Post-crawl processing (Independent Tasks)
-        try:
-            _process_instagram_metrics_after_crawl(
-                self.database_url,
-                run_id,
-                observed_library_ids,
-            )
-        except Exception:
-            LOGGER.exception(f"instagram metrics failed for competitor_id={competitor_id}")
+        LOGGER.info(
+            "instagram metrics skipped in crawl path for competitor_id=%s run_id=%s",
+            competitor_id,
+            run_id,
+        )
 
-        if new_library_ids:
+        if new_library_ids and self.run_gemini:
             try:
                 _process_videos_after_crawl(self.database_url, new_library_ids)
             except Exception:
@@ -245,6 +256,12 @@ class AdFungusSpider(Spider):
                 _process_embeddings_after_crawl(self.database_url, new_library_ids)
             except Exception:
                 LOGGER.exception(f"embedding generation failed for competitor_id={competitor_id}")
+        elif new_library_ids:
+            LOGGER.info(
+                "gemini post-processing skipped for competitor_id=%s new_library_ids=%s",
+                competitor_id,
+                len(new_library_ids),
+            )
 
 
 def main():
@@ -261,6 +278,7 @@ def main():
     start_time = time.perf_counter()
     
     spider = AdFungusSpider(database_url=database_url)
+    LOGGER.info("spider crawl job_id=%s", spider.job_id)
     # Keep spider concurrency conservative for Meta crawl stability.
     spider.start(concurrency=2, engine="stealthy")
     

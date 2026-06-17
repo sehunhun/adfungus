@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import asyncio
 import hashlib
 import json
@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import urlparse
@@ -154,6 +155,36 @@ CREATE INDEX IF NOT EXISTS idx_google_ad_video_extractions_hooking_categories
 
 
 # Pydantic Response Schema
+class HookingCategory(str, Enum):
+    PAIN_POINT = "페인포인트"
+    BEFORE_AFTER = "비포애프터"
+    PRODUCT_COMPARISON = "제품비교"
+    AUTHORITY = "권위"
+    THREAT = "위협"
+    CURIOSITY = "호기심"
+    PARADOX_IRONY = "역설/반어"
+    ENLIGHTENMENT = "계몽"
+    BENEFIT = "혜택"
+    PRODUCT_EFFECT = "제품효과"
+    URGENCY = "긴급성"
+
+    @property
+    def description(self) -> str:
+        return {
+            HookingCategory.PAIN_POINT: "사용자의 불편함이나 고민을 건드려 공감대를 만들고 해결책을 제시하는 방식",
+            HookingCategory.BEFORE_AFTER: "사용 전후의 극적인 변화, 효과, 생활 차이를 보여주는 방식",
+            HookingCategory.PRODUCT_COMPARISON: "타사 제품이나 기존 대안과 비교해 우위를 직접 드러내는 방식",
+            HookingCategory.AUTHORITY: "전문가, 1위 기록, 인증 등을 통해 신뢰도를 높이는 방식",
+            HookingCategory.THREAT: "문제를 방치했을 때의 위험성을 강조해 경각심을 주는 방식",
+            HookingCategory.CURIOSITY: "사람들의 궁금증, 호기심을 자극하는 방식",
+            HookingCategory.PARADOX_IRONY: "기존 상식과 반대되거나 모순적으로 들리는 표현으로 시선을 잡는 방식",
+            HookingCategory.ENLIGHTENMENT: "사람들이 몰랐던 사실, 원리, 꿀팁을 알려주며 깨달음을 주는 방식",
+            HookingCategory.BENEFIT: "할인, 1+1, 증정 등 구매 이득을 직접적으로 강조하는 방식",
+            HookingCategory.PRODUCT_EFFECT: "제품의 핵심 기능이나 눈에 띄는 효과를 직접적으로 보여주거나 강조하는 방식",
+            HookingCategory.URGENCY: "마감 임박, 수량 한정 등을 강조해 즉각적인 행동을 유도하는 방식",
+        }.get(self, "")
+
+
 class TimelineItem(BaseModel):
     time_range: str
     text: str
@@ -163,7 +194,7 @@ class HookingSection(BaseModel):
     audio: list[TimelineItem]
     screen_text: list[TimelineItem]
     visual_direction: str
-    categories: list[str]
+    categories: list[HookingCategory]
 
 
 class BodySection(BaseModel):
@@ -187,29 +218,30 @@ class VideoExtractionResponse(BaseModel):
     sections: VideoSections
 
 
-VIDEO_TEXT_EXTRACTION_PROMPT = """
-당신은 광고 분석 전문가입니다. 주어진 광고 영상을 분석하여 대본(Audio Transcript)과 화면에 나타나는 텍스트(Screen Text)를 추출하고, 광고의 구조를 3단계(Hooking, Body, Closing)로 분류하여 JSON 형식으로 응답하세요.
+VIDEO_TEXT_EXTRACTION_PROMPT = f"""
+?뱀떊? 愿묎퀬 遺꾩꽍 ?꾨Ц媛?낅땲?? 二쇱뼱吏?愿묎퀬 ?곸긽??遺꾩꽍?섏뿬 ?蹂?Audio Transcript)怨??붾㈃???섑??섎뒗 ?띿뒪??Screen Text)瑜?異붿텧?섍퀬, 愿묎퀬??援ъ“瑜?3?④퀎(Hooking, Body, Closing)濡?遺꾨쪟?섏뿬 JSON ?뺤떇?쇰줈 ?묐떟?섏꽭??
 
-모든 응답은 한국어로 작성해야 합니다.
+紐⑤뱺 ?묐떟? ?쒓뎅?대줈 ?묒꽦?댁빞 ?⑸땲??
 
-1. **Hooking (광고의 도입부, 보통 0~5초 내외)**
-   - 시청자의 이목을 끄는 오디오와 화면 텍스트를 모두 기재하세요.
-   - `visual_direction`: 이 구간의 시각적 연출 특징을 설명하세요.
-   - `categories`: 다음 중 해당되는 카테고리를 리스트로 선택하세요: [문제제기, 호기심, 혜택강조, 정보제공, 일상공감, 유머, 셀럽/인플루언서, 비포애프터].
+1. **Hooking (愿묎퀬???꾩엯遺, 蹂댄넻 0~5珥??댁쇅)**
+   - ?쒖껌?먯쓽 ?대ぉ???꾨뒗 ?ㅻ뵒?ㅼ? ?붾㈃ ?띿뒪?몃? 紐⑤몢 湲곗옱?섏꽭??
+   - `visual_direction`: ??援ш컙???쒓컖???곗텧 ?뱀쭠???ㅻ챸?섏꽭??
+   - `categories`: ?ㅼ쓬 移댄뀒怨좊━ ?ㅻ챸??李멸퀬?섏뿬 媛???곸젅????ぉ?ㅼ쓣 由ъ뒪?몃줈 ?좏깮?섏꽭??
+{chr(10).join([f"     - {c.value}: {c.description}" for c in HookingCategory])}
 
-2. **Body (본론)**
-   - 제품의 특징이나 장점을 설명하는 구간입니다.
-   - 오디오 대본과 화면 텍스트를 시간대별로 상세히 기재하세요.
+2. **Body (蹂몃줎)**
+   - ?쒗뭹???뱀쭠?대굹 ?μ젏???ㅻ챸?섎뒗 援ш컙?낅땲??
+   - ?ㅻ뵒???蹂멸낵 ?붾㈃ ?띿뒪?몃? ?쒓컙?蹂꾨줈 ?곸꽭??湲곗옱?섏꽭??
 
-3. **Closing (마무리)**
-   - 구매 유도나 브랜드 로고가 노출되는 마지막 구간입니다.
-   - `cta`: 마지막에 유도하는 행동(Call to Action) 문구를 추출하세요. (예: 지금 구매하기, 프로필 링크 클릭 등)
+3. **Closing (留덈Т由?**
+   - 援щℓ ?좊룄??釉뚮옖??濡쒓퀬媛 ?몄텧?섎뒗 留덉?留?援ш컙?낅땲??
+   - `cta`: 留덉?留됱뿉 ?좊룄?섎뒗 ?됰룞(Call to Action) 臾멸뎄瑜?異붿텧?섏꽭?? (?? 吏湲?援щℓ?섍린, ?꾨줈??留곹겕 ?대┃ ??
 
-**주의사항:**
-- 각 텍스트 항목에는 반드시 `time_range` (예: "00:01 ~ 00:03")를 포함해야 합니다.
-- 만약 특정 구간에 오디오나 텍스트가 없다면 빈 리스트(`[]`)를 반환하세요.
-- 화면에 로고나 제품명만 아주 잠깐 지나가는 경우에도 최대한 `screen_text`에 포함시키세요.
-- 모든 시간 형식은 `MM:SS` 형식을 따르며, 영상의 전체 길이를 고려하세요.
+**二쇱쓽?ы빆:**
+- 媛??띿뒪????ぉ?먮뒗 諛섎뱶??`time_range` (?? "00:01 ~ 00:03")瑜??ы븿?댁빞 ?⑸땲??
+- 留뚯빟 ?뱀젙 援ш컙???ㅻ뵒?ㅻ굹 ?띿뒪?멸? ?녿떎硫?鍮?由ъ뒪??`[]`)瑜?諛섑솚?섏꽭??
+- ?붾㈃??濡쒓퀬???쒗뭹紐낅쭔 ?꾩＜ ?좉퉸 吏?섍???寃쎌슦?먮룄 理쒕???`screen_text`???ы븿?쒗궎?몄슂.
+- 紐⑤뱺 ?쒓컙 ?뺤떇? `MM:SS` ?뺤떇???곕Ⅴ硫? ?곸긽???꾩껜 湲몄씠瑜?怨좊젮?섏꽭??
 """
 
 
@@ -219,6 +251,20 @@ def _setup_schema(conn: psycopg.Connection[Any]) -> None:
 
 def _setup_google_schema(conn: psycopg.Connection[Any]) -> None:
     conn.execute(GOOGLE_SCHEMA_SQL)
+
+
+def _library_ids_for_run(conn: psycopg.Connection[Any], run_id: int) -> List[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT library_id
+            FROM meta_ads
+            WHERE first_seen_run_id = %s
+            ORDER BY library_id ASC
+            """,
+            (run_id,),
+        )
+        return [str(row[0]) for row in cur.fetchall() if str(row[0]).strip()]
 
 
 def _seed_pending_videos(
@@ -481,13 +527,14 @@ def _extract_video_text(client: genai.Client, path: Path) -> Dict[str, Any]:
         parsed_response = getattr(response, "parsed", None)
         if parsed_response is not None:
             if hasattr(parsed_response, "model_dump"):
-                data = parsed_response.model_dump()
+                data = parsed_response.model_dump(mode="json")
             elif isinstance(parsed_response, dict):
                 data = parsed_response
             else:
                 raise RuntimeError(
                     f"Gemini returned unsupported parsed response type: {type(parsed_response).__name__}"
                 )
+
         else:
             if not response.text:
                 raise RuntimeError("Gemini returned empty response")
@@ -983,19 +1030,28 @@ def main():
     )
     parser.add_argument("--limit", type=int, default=_int_env("VIDEO_WORKER_LIMIT", 0))
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--run-id", type=int, help="Only process ads first seen in this crawl run.")
     args = parser.parse_args()
 
     database_url = _required_env("DATABASE_URL")
     concurrency = _int_env("VIDEO_CONCURRENCY", 10)
+    library_ids = None
+
+    if args.run_id is not None:
+        with psycopg.connect(database_url, autocommit=False) as conn:
+            library_ids = _library_ids_for_run(conn, args.run_id)
+        LOGGER.info("video worker run_id=%s library_ids=%s", args.run_id, len(library_ids))
 
     success, total = process_pending_videos(
         database_url=database_url,
         limit=args.limit if args.limit > 0 else None,
         dry_run=args.dry_run,
         concurrency=concurrency,
+        library_ids=library_ids,
     )
     LOGGER.info("Meta video processing finished: %s/%s successes", success, total)
 
 
 if __name__ == "__main__":
     main()
+

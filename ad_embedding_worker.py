@@ -21,7 +21,8 @@ from psycopg.types.json import Jsonb
 LOGGER = logging.getLogger("adfungus-embedding-worker")
 MODEL_NAME = "gemini-embedding-2"
 DEFAULT_TOP_K = 10
-SIMILARITY_THRESHOLD = 0.96
+SIMILARITY_MIN_THRESHOLD = 0.90
+SIMILARITY_MAX_THRESHOLD = 0.99
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta_ad_similarity_runs (
@@ -100,6 +101,20 @@ def _int_env(name: str, default: int) -> int:
 
 def _setup_schema(conn: psycopg.Connection[Any]) -> None:
     conn.execute(SCHEMA_SQL)
+
+
+def _library_ids_for_run(conn: psycopg.Connection[Any], run_id: int) -> List[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT library_id
+            FROM meta_ads
+            WHERE first_seen_run_id = %s
+            ORDER BY library_id ASC
+            """,
+            (run_id,),
+        )
+        return [str(row[0]) for row in cur.fetchall() if str(row[0]).strip()]
 
 
 def _pending_embedding_ads(conn: psycopg.Connection[Any], library_ids: List[str] | None = None) -> List[Dict[str, Any]]:
@@ -285,7 +300,9 @@ def _store_similarity_scores(
             top_indexes = np.asarray([], dtype=np.int64)
         
         # 0.96 임계값 기반 카운트 및 ID 추출
-        threshold_indexes = np.flatnonzero(row >= SIMILARITY_THRESHOLD)
+        threshold_indexes = np.flatnonzero(
+            (row >= SIMILARITY_MIN_THRESHOLD) & (row < SIMILARITY_MAX_THRESHOLD)
+        )
         if threshold_indexes.size:
             threshold_indexes = threshold_indexes[np.argsort(row[threshold_indexes])[::-1]]
         threshold_matches = [library_ids[int(index)] for index in threshold_indexes]
@@ -476,6 +493,7 @@ def process_ad_embeddings(*, database_url: str, top_k: int = DEFAULT_TOP_K, libr
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Embed Meta ads and score ad similarity.")
     parser.add_argument("--top-k", type=int, default=_int_env("AD_EMBEDDING_TOP_K", DEFAULT_TOP_K))
+    parser.add_argument("--run-id", type=int, help="Only process ads first seen in this crawl run.")
     return parser.parse_args(argv)
 
 
@@ -484,7 +502,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     _setup_logging()
     args = _parse_args(argv or sys.argv[1:])
     database_url = _required_env("DATABASE_URL")
-    process_ad_embeddings(database_url=database_url, top_k=args.top_k)
+    library_ids = None
+    if args.run_id is not None:
+        with psycopg.connect(database_url, autocommit=False) as conn:
+            library_ids = _library_ids_for_run(conn, args.run_id)
+        LOGGER.info("embedding worker run_id=%s library_ids=%s", args.run_id, len(library_ids))
+    process_ad_embeddings(database_url=database_url, top_k=args.top_k, library_ids=library_ids)
     return 0
 
 

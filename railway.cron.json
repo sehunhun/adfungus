@@ -4,9 +4,8 @@
     "builder": "DOCKERFILE"
   },
   "deploy": {
-    "startCommand": "python test_spider_targeted.py",
+    "startCommand": "python spider_targeted.py",
     "cronSchedule": "0 17 * * *",
     "restartPolicyType": "NEVER"
   }
-
 }

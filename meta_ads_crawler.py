@@ -170,8 +170,10 @@ def _extract_instagram_username_from_href(href: str) -> str:
 
 
 def _parse_influencer_context(card: Any) -> Dict[str, Any]:
-    anchors = list(card.css("a[href]"))
-    has_context = len(anchors) >= 2
+    context = card.css("div.xc26acl.x78zum5.x2lwn1j.xeuugli").first
+    anchors = list(context.css("a[href]")) if context else []
+    anchor_count = len(anchors)
+    has_context = anchor_count == 2
     display_name = ""
     username = ""
 
@@ -183,6 +185,7 @@ def _parse_influencer_context(card: Any) -> Dict[str, Any]:
         username = _extract_instagram_username_from_href(href)
 
     return {
+        "influencerAnchorCount": anchor_count,
         "hasInfluencerContext": has_context,
         "influencerDisplayName": display_name,
         "influencerInstagramUsername": username,
@@ -440,6 +443,7 @@ def _parse_body_text(card: Any) -> str:
     text = unescape(_node_text(card))
     parts = re.split(r"\bSponsored\b|광고", text, maxsplit=1, flags=re.IGNORECASE)
     body = parts[1] if len(parts) > 1 else text
+    body = re.sub(r"\bLow impression count\b", " ", body, flags=re.IGNORECASE)
     body = re.sub(
         r"\b\d{1,2}:\d{2}(?::\d{2})?\s*/\s*\d{1,2}:\d{2}(?::\d{2})?\b", " ", body
     )
@@ -542,6 +546,7 @@ def parse_ad_card(card: Any) -> Optional[Dict[str, Any]]:
         "active": active,
         "platforms": platforms,
         "body": body,
+        "influencerAnchorCount": influencer_context["influencerAnchorCount"],
         "hasInfluencerContext": influencer_context["hasInfluencerContext"],
         "influencerDisplayName": influencer_context["influencerDisplayName"],
         "influencerInstagramUsername": influencer_context["influencerInstagramUsername"],
@@ -1422,6 +1427,28 @@ def _candidate_instagram_username(candidate: Dict[str, Any]) -> str:
     return ""
 
 
+def _parse_follower_count(value: Any) -> int:
+    text = _clean(value).lower().replace(",", "").replace("명", "").strip()
+    if not text:
+        return 0
+
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([kmb천만억]?)", text, flags=re.IGNORECASE)
+    if not match:
+        return 0
+
+    number = float(match.group(1))
+    unit = (match.group(2) or "").lower()
+    multipliers = {
+        "k": 1_000,
+        "m": 1_000_000,
+        "b": 1_000_000_000,
+        "천": 1_000,
+        "만": 10_000,
+        "억": 100_000_000,
+    }
+    return int(number * multipliers.get(unit, 1))
+
+
 def _select_exact_influencer_typeahead_candidate(
     display_name: str,
     candidates: List[Dict[str, Any]],
@@ -1430,11 +1457,19 @@ def _select_exact_influencer_typeahead_candidate(
     if not target:
         return None
 
+    exact_matches: List[Dict[str, Any]] = []
     for candidate in candidates:
         candidate_name = _clean(candidate.get("brand"))
         if candidate_name and _normalize_brand_key(candidate_name) == target:
-            return candidate
-    return None
+            exact_matches.append(candidate)
+
+    if not exact_matches:
+        return None
+
+    return max(
+        exact_matches,
+        key=lambda candidate: _parse_follower_count(candidate.get("instagram_followers_text")),
+    )
 
 
 def _ad_needs_influencer_username_fallback(ad: Dict[str, Any]) -> bool:
@@ -1738,7 +1773,7 @@ async def _collect_summary_popup_groups(
 
 async def crawl_meta_ads(
     url: str,
-    scroll_wait_ms: int = 1200,
+    scroll_wait_ms: int = 3000,
     debug: bool = False,
     stable_rounds: int = 3,
     stable_max_rounds: int = 18,
@@ -1765,7 +1800,7 @@ async def crawl_meta_ads(
     async with AsyncStealthySession(**session_config) as session:
 
         async def page_action(page: Any) -> None:
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(10000)
             if limit > 0:
                 await _wait_until_min_library_ids(
                     page,
@@ -1820,7 +1855,7 @@ async def search_meta_advertisers(
     *,
     country: str = "KR",
     limit: int = 10,
-    scroll_wait_ms: int = 1200,
+    scroll_wait_ms: int = 3000,
     debug: bool = False,
     include_timings: bool = False,
     **kwargs,  # Accept detail_concurrency for backward compatibility
@@ -1850,7 +1885,7 @@ async def search_meta_advertisers(
         async def page_action(page: Any) -> None:
             if debug:
                 LOGGER.info("[Search] Page action triggered, waiting for initial load...")
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(10000)
             
             # 0. 일반적인 방해 요소(쿠키 배너 등) 닫기 시도
             try:
@@ -1864,37 +1899,7 @@ async def search_meta_advertisers(
                 pass
 
             # 1. 검색창 클릭하여 팝업 활성화
-            if debug:
-                LOGGER.info("[Search] Looking for keyword/advertiser search input...")
-            
-            # 사용자가 제공한 HTML 구조 반영: type="search" 및 관련 placeholder 사용
-            search_input = page.locator('input[type="search"][placeholder*="검색"], input[type="search"][placeholder*="Search"]').first
-            
-            try:
-                if await search_input.count() > 0:
-                    if debug:
-                        LOGGER.info("[Search] Keyword search input found, clicking (forced)...")
-                    # scrollTo를 명시적으로 수행하여 가시성 확보 시도
-                    await search_input.scroll_into_view_if_needed()
-                    await search_input.click(force=True, timeout=5000)
-                    await page.wait_for_timeout(2000)
-                else:
-                    if debug:
-                        LOGGER.warning("[Search] Keyword search input NOT found. Retrying with fallback selector...")
-                    # 백업: 일반적인 input 태그 중 검색 관련
-                    search_input = page.locator('input[placeholder*="광고주"], input[placeholder*="advertiser"]').first
-                    if await search_input.count() > 0:
-                        await search_input.click(force=True)
-                        await page.wait_for_timeout(2000)
-            except Exception as e:
-                LOGGER.error(f"[Search] Error clicking search input: {e}")
-                # 클릭 실패 시 JavaScript로 직접 클릭 시도
-                try:
-                    if debug: LOGGER.info("[Search] Attempting JS click as fallback...")
-                    await page.evaluate('(el) => el.click()', await search_input.element_handle())
-                    await page.wait_for_timeout(2000)
-                except Exception as js_e:
-                    LOGGER.error(f"[Search] JS click also failed: {js_e}")
+            await _activate_ads_library_search_input(page, debug=debug, log_prefix="[Search]")
             
             # 2. 광고주 팝업 요소 파싱
             if debug:
@@ -1967,7 +1972,7 @@ async def search_influencer_typeahead_candidates(
     *,
     country: str = "KR",
     limit: int = 10,
-    scroll_wait_ms: int = 1200,
+    scroll_wait_ms: int = 3000,
     debug: bool = False,
 ) -> List[Dict[str, Any]]:
     query = _clean(display_name)
@@ -1975,7 +1980,7 @@ async def search_influencer_typeahead_candidates(
         return []
 
     StealthyFetcher.configure(adaptive=True)
-    url = build_ads_library_search_url("", country=country)
+    url = build_ads_library_search_url(query, country=country)
     results: List[Dict[str, Any]] = []
 
     session_config: Dict[str, Any] = {
@@ -1989,7 +1994,7 @@ async def search_influencer_typeahead_candidates(
 
     async with AsyncStealthySession(**session_config) as session:
         async def page_action(page: Any) -> None:
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(10000)
             await _close_ads_library_overlays(page)
             results.extend(
                 await _read_influencer_typeahead_candidates_from_page(
@@ -2032,6 +2037,54 @@ async def _close_ads_library_overlays(page: Any) -> None:
         pass
 
 
+async def _activate_ads_library_search_input(
+    page: Any,
+    *,
+    debug: bool = False,
+    log_prefix: str = "[Search]",
+) -> Any | None:
+    if debug:
+        LOGGER.info("%s Looking for keyword/advertiser search input...", log_prefix)
+
+    search_input = page.locator(
+        'input[type="search"][placeholder*="검색"], input[type="search"][placeholder*="Search"]'
+    ).first
+
+    try:
+        if await search_input.count() > 0:
+            if debug:
+                LOGGER.info("%s Keyword search input found, clicking (forced)...", log_prefix)
+            await search_input.scroll_into_view_if_needed()
+            await search_input.click(force=True, timeout=5000)
+            await page.wait_for_timeout(2000)
+            return search_input
+
+        if debug:
+            LOGGER.warning("%s Keyword search input NOT found. Retrying with fallback selector...", log_prefix)
+        search_input = page.locator(
+            'input[placeholder*="광고주"], input[placeholder*="advertiser"]'
+        ).first
+        if await search_input.count() > 0:
+            await search_input.scroll_into_view_if_needed()
+            await search_input.click(force=True, timeout=5000)
+            await page.wait_for_timeout(2000)
+            return search_input
+    except Exception as exc:
+        LOGGER.error("%s Error clicking search input: %s", log_prefix, exc)
+        try:
+            if debug:
+                LOGGER.info("%s Attempting JS click as fallback...", log_prefix)
+            handle = await search_input.element_handle()
+            if handle is not None:
+                await page.evaluate("(el) => el.click()", handle)
+                await page.wait_for_timeout(2000)
+                return search_input
+        except Exception as js_exc:
+            LOGGER.error("%s JS click also failed: %s", log_prefix, js_exc)
+
+    return None
+
+
 async def _ads_library_search_input(page: Any) -> Any | None:
     search_input = page.locator(
         'input[type="search"][placeholder*="검색"], input[type="search"][placeholder*="Search"]'
@@ -2053,23 +2106,28 @@ async def _read_influencer_typeahead_candidates_from_page(
     *,
     limit: int,
     scroll_wait_ms: int,
+    extra_wait_ms: int = 0,
     debug: bool,
 ) -> List[Dict[str, Any]]:
     query = _clean(display_name)
     if not query:
         return []
 
-    search_input = await _ads_library_search_input(page)
+    search_input = await _activate_ads_library_search_input(
+        page,
+        debug=debug,
+        log_prefix="[InfluencerFallback]",
+    )
     if search_input is None:
         LOGGER.warning("influencer fallback search input not found display_name=%r", query)
         return []
 
-    await search_input.scroll_into_view_if_needed()
-    await search_input.click(force=True, timeout=5000)
     await search_input.fill("", timeout=5000)
     await page.wait_for_timeout(250)
     await search_input.fill(query, timeout=5000)
     await page.wait_for_timeout(scroll_wait_ms)
+    if extra_wait_ms > 0:
+        await page.wait_for_timeout(extra_wait_ms)
 
     candidates: List[Dict[str, Any]] = []
     advertiser_options = page.locator('li[id^="pageID:"]')
@@ -2123,7 +2181,7 @@ async def fill_missing_influencer_instagram_usernames(
     *,
     country: str = "KR",
     limit: int = 10,
-    scroll_wait_ms: int = 1200,
+    scroll_wait_ms: int = 3000,
     debug: bool = False,
 ) -> Dict[str, str]:
     display_names_by_key: Dict[str, str] = {}
@@ -2144,7 +2202,8 @@ async def fill_missing_influencer_instagram_usernames(
     cache: Dict[str, str] = {key: "" for key in display_names_by_key}
 
     StealthyFetcher.configure(adaptive=True)
-    url = build_ads_library_search_url("", country=country)
+    first_display_name = next(iter(display_names_by_key.values()), "")
+    url = build_ads_library_search_url(first_display_name, country=country)
     session_config: Dict[str, Any] = {
         "headless": True,
         "real_chrome": os.getenv("META_ADS_REAL_CHROME", "true").lower()
@@ -2156,9 +2215,10 @@ async def fill_missing_influencer_instagram_usernames(
 
     async with AsyncStealthySession(**session_config) as session:
         async def page_action(page: Any) -> None:
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(10000)
             await _close_ads_library_overlays(page)
 
+            first_cache_key = next(iter(display_names_by_key.keys()), "")
             for cache_key, display_name in display_names_by_key.items():
                 username = ""
                 try:
@@ -2167,6 +2227,7 @@ async def fill_missing_influencer_instagram_usernames(
                         display_name,
                         limit=limit,
                         scroll_wait_ms=scroll_wait_ms,
+                        extra_wait_ms=scroll_wait_ms if cache_key == first_cache_key else 0,
                         debug=debug,
                     )
                     selected = _select_exact_influencer_typeahead_candidate(display_name, candidates)
@@ -2221,7 +2282,7 @@ def main() -> None:
         description="Meta Ads Library crawler with scrapling"
     )
     parser.add_argument("--page_id", default=DEFAULT_PAGE_ID)
-    parser.add_argument("--scroll-wait-ms", type=int, default=1200)
+    parser.add_argument("--scroll-wait-ms", type=int, default=3000)
     parser.add_argument("--stable-rounds", type=int, default=3)
     parser.add_argument("--stable-max-rounds", type=int, default=18)
     parser.add_argument("--debug", action="store_true")

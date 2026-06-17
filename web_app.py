@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import logging
+import mimetypes
 import os
 import time
 import uuid
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List
+from urllib.parse import urlparse, quote
 
 from jwt import InvalidTokenError, PyJWKClient, decode as jwt_decode
 import psycopg
 from dotenv import load_dotenv
+import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -20,8 +24,23 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 
 from ad_embedding_worker import SCHEMA_SQL as EMBEDDING_SCHEMA_SQL
-from cron_runner import SCHEMA_SQL, _database_url, _ensure_default_workspace, sync_competitor
+from cron_runner_old import SCHEMA_SQL, _database_url, _ensure_default_workspace, sync_competitor
 from meta_ads_crawler import search_meta_advertisers
+from google import genai
+from google.genai import types
+import numpy as np
+from sklearn.cluster import KMeans
+
+# 분석 결과 캐시 테이블 스키마
+ANALYSIS_CACHE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS hooking_analysis_cache (
+    workspace_id INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    result_json JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (workspace_id, category)
+);
+"""
 
 
 ROOT = Path(__file__).resolve().parent
@@ -84,6 +103,11 @@ class CompetitorPatchRequest(BaseModel):
     folder_id: int | None = None
 
 
+class CompetitorReorderRequest(BaseModel):
+    folder_id: int | None = None
+    competitor_ids: List[int]
+
+
 class SavedAdRequest(BaseModel):
     library_id: str
 
@@ -111,6 +135,59 @@ def _library_id_values(values: Any) -> list[str]:
         if library_id:
             ids.append(library_id)
     return ids
+
+
+def _normalize_brand_name(value: str) -> str:
+    return " ".join((value or "").split()).strip().lower()
+
+
+def _brand_normalized_sql(expr: str) -> str:
+    return f"LOWER(BTRIM(COALESCE({expr}, '')))"
+
+
+def _hidden_brand_not_exists_clause(*, workspace_expr: str, brand_expr: str) -> str:
+    return f"""
+        NOT EXISTS (
+            SELECT 1
+            FROM workspace_hidden_brands whb
+            WHERE whb.workspace_id = {workspace_expr}
+              AND whb.brand_normalized = {_brand_normalized_sql(brand_expr)}
+        )
+    """
+
+
+def _hooking_category_member_rows(
+    conn: psycopg.Connection[Any],
+    *,
+    workspace_id: int,
+    category: str,
+) -> list[dict[str, Any]]:
+    return conn.execute(
+        """
+        WITH successful_extractions AS (
+            SELECT DISTINCT e.library_id, e.hooking_audio, e.hooking_screen_text, e.hooking_categories
+            FROM workspace_meta_ads wa
+            JOIN meta_ads a ON a.library_id = wa.library_id
+            JOIN meta_ad_video_extractions e ON e.library_id = wa.library_id
+            WHERE wa.workspace_id = %s
+              AND e.status = 'success'
+              AND {_hidden_brand_not_exists_clause(workspace_expr='wa.workspace_id', brand_expr='a.brand')}
+        ),
+        category_members AS (
+            SELECT DISTINCT
+                e.library_id,
+                e.hooking_audio,
+                e.hooking_screen_text
+            FROM successful_extractions e
+            CROSS JOIN LATERAL unnest(COALESCE(e.hooking_categories, '{}'::text[])) AS raw(category_value)
+            CROSS JOIN LATERAL regexp_split_to_table(raw.category_value, '\\s*,\\s*') AS split(split_category)
+            WHERE btrim(split.split_category) = %s
+        )
+        SELECT library_id, hooking_audio, hooking_screen_text
+        FROM category_members
+        """,
+        (workspace_id, category),
+    ).fetchall()
 
 
 def _clerk_auth_enabled() -> bool:
@@ -172,13 +249,50 @@ def _connect() -> psycopg.Connection[Any]:
     return psycopg.connect(_database_url(), row_factory=dict_row)
 
 
+def _sanitize_download_name(value: str, fallback: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in (value or "").strip())
+    cleaned = cleaned.strip("._")
+    return cleaned or fallback
+
+
+def _guess_extension_from_url_or_type(url: str, content_type: str | None, fallback: str) -> str:
+    path = urlparse(url).path
+    suffix = Path(path).suffix.lower()
+    if suffix and len(suffix) <= 5:
+        return suffix
+
+    if content_type:
+        guessed = mimetypes.guess_extension(content_type.split(";")[0].strip())
+        if guessed:
+            if guessed == ".jpe":
+                return ".jpg"
+            return guessed
+
+    return fallback
+
+
 def _init_db() -> int:
     with _connect() as conn:
-        conn.execute(SCHEMA_SQL)
-        conn.execute(EMBEDDING_SCHEMA_SQL)
-        workspace_id = _ensure_default_workspace(conn)
-        conn.commit()
-        return workspace_id
+        with conn.cursor() as cur:
+            # check if basic tables exist
+            cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'app_users' LIMIT 1")
+            if not cur.fetchone():
+                cur.execute(SCHEMA_SQL)
+            
+            # check if embedding table exists
+            cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'meta_ad_embeddings' LIMIT 1")
+            if not cur.fetchone():
+                cur.execute(EMBEDDING_SCHEMA_SQL)
+            
+            # check if cache table exists
+            cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'hooking_analysis_cache' LIMIT 1")
+            if not cur.fetchone():
+                cur.execute(ANALYSIS_CACHE_SCHEMA)
+            cur.execute("ALTER TABLE competitors ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0")
+
+            workspace_id = _ensure_default_workspace(conn)
+            conn.commit()
+            return workspace_id
 
 
 def _workspace_context(request: Request, conn: psycopg.Connection[Any]) -> dict[str, Any]:
@@ -362,7 +476,7 @@ def state(
         competitors = conn.execute(
             """
             WITH workspace_competitors AS (
-                SELECT id, folder_id, page_id, brand, brand_logo_url, monitoring_enabled, created_at
+                SELECT id, folder_id, sort_order, page_id, brand, brand_logo_url, monitoring_enabled, created_at
                 FROM competitors
                 WHERE workspace_id = %s
             )
@@ -383,9 +497,10 @@ def state(
                 FROM workspace_meta_ads wa
                 JOIN meta_ads a ON a.library_id = wa.library_id
                 WHERE wa.workspace_id = %s
+                  AND """ + _hidden_brand_not_exists_clause(workspace_expr="wa.workspace_id", brand_expr="a.brand") + """
                 GROUP BY wa.competitor_id
             ) stats ON stats.competitor_id = c.id
-            ORDER BY c.created_at DESC
+            ORDER BY c.folder_id NULLS FIRST, c.sort_order ASC, c.created_at ASC
             """,
             (workspace_id, workspace_id),
         ).fetchall()
@@ -408,7 +523,7 @@ def state(
             order_clause = "(COALESCE(wa.ended_at, wa.last_seen_at, now()) - a.start_date) DESC"
 
         # 상태 필터링 추가
-        where_clause = "wa.workspace_id = %s"
+        where_clause = "wa.workspace_id = %s AND " + _hidden_brand_not_exists_clause(workspace_expr="wa.workspace_id", brand_expr="a.brand")
         params = [workspace_id]
         if status in ("running", "ended"):
             where_clause += " AND wa.status = %s"
@@ -502,7 +617,12 @@ def state(
         else:
             # 기존 방식: DB에서 개수 조회 및 페이징 처리
             total_row = conn.execute(
-                f"SELECT COUNT(*) as count FROM workspace_meta_ads wa WHERE {where_clause}",
+                f"""
+                SELECT COUNT(*) as count
+                FROM workspace_meta_ads wa
+                JOIN meta_ads a ON a.library_id = wa.library_id
+                WHERE {where_clause}
+                """,
                 params
             ).fetchone()
             total_count = int(total_row["count"])
@@ -519,12 +639,26 @@ def state(
             total_count
         )
 
+        # 총 저장된 광고 개수 조회
+        saved_row = conn.execute(
+            f"""
+            SELECT COUNT(*)::int as count
+            FROM saved_ads s
+            JOIN meta_ads a ON a.library_id = s.library_id
+            WHERE s.workspace_id = %s
+              AND {_hidden_brand_not_exists_clause(workspace_expr='s.workspace_id', brand_expr='a.brand')}
+            """,
+            (workspace_id,)
+        ).fetchone()
+        saved_count = int(saved_row["count"] or 0)
+
     payload = {
         "workspace_id": workspace_id,
         "folders": folders,
         "competitors": competitors,
         "ads": ads,
         "total_count": total_count,
+        "saved_count": saved_count,
     }
     total_ms = _ms(request_started_at)
     logger.info(
@@ -541,6 +675,211 @@ def state(
     return payload
 
 
+@app.get("/api/creative-composition/top-hooking-categories")
+def top_hooking_categories(request: Request) -> dict[str, Any]:
+    with _connect() as conn:
+        ctx = _workspace_context(request, conn)
+        workspace_id = ctx["workspace_id"]
+
+        total_row = conn.execute(
+            """
+            SELECT COUNT(DISTINCT e.library_id)::int AS total_analyzed_ads
+            FROM workspace_meta_ads wa
+            JOIN meta_ads a ON a.library_id = wa.library_id
+            JOIN meta_ad_video_extractions e ON e.library_id = wa.library_id
+            WHERE wa.workspace_id = %s
+              AND e.status = 'success'
+              AND """ + _hidden_brand_not_exists_clause(workspace_expr="wa.workspace_id", brand_expr="a.brand") + """
+            """,
+            (workspace_id,),
+        ).fetchone()
+
+        rows = conn.execute(
+            """
+            WITH successful_extractions AS (
+                SELECT DISTINCT e.library_id, e.hooking_categories
+                FROM workspace_meta_ads wa
+                JOIN meta_ads a ON a.library_id = wa.library_id
+                JOIN meta_ad_video_extractions e ON e.library_id = wa.library_id
+                WHERE wa.workspace_id = %s
+                  AND e.status = 'success'
+                  AND """ + _hidden_brand_not_exists_clause(workspace_expr="wa.workspace_id", brand_expr="a.brand") + """
+            ),
+            categories AS (
+                SELECT DISTINCT
+                    e.library_id,
+                    btrim(split.split_category) AS category
+                FROM successful_extractions e
+                CROSS JOIN LATERAL unnest(COALESCE(e.hooking_categories, '{}'::text[])) AS raw(category_value)
+                CROSS JOIN LATERAL regexp_split_to_table(raw.category_value, '\\s*,\\s*') AS split(split_category)
+            ),
+            ranked AS (
+                SELECT
+                    category,
+                    COUNT(DISTINCT library_id)::int AS count
+                FROM categories
+                WHERE category IS NOT NULL
+                  AND category <> ''
+                GROUP BY category
+            )
+            SELECT
+                ROW_NUMBER() OVER (ORDER BY count DESC, category ASC)::int AS rank,
+                category,
+                count
+            FROM ranked
+            ORDER BY count DESC, category ASC
+            LIMIT 10
+            """,
+            (workspace_id,),
+        ).fetchall()
+
+    return {
+        "total_analyzed_ads": int(total_row["total_analyzed_ads"] or 0),
+        "items": rows,
+    }
+
+
+@app.get("/api/creative-composition/by-type")
+def creative_composition_by_type(request: Request) -> dict[str, Any]:
+    with _connect() as conn:
+        ctx = _workspace_context(request, conn)
+        workspace_id = ctx["workspace_id"]
+
+        # 1. Get all categories and counts
+        categories_rows = conn.execute(
+            """
+            WITH successful_extractions AS (
+                SELECT DISTINCT e.library_id, e.hooking_categories
+                FROM workspace_meta_ads wa
+                JOIN meta_ads a ON a.library_id = wa.library_id
+                JOIN meta_ad_video_extractions e ON e.library_id = wa.library_id
+                WHERE wa.workspace_id = %s
+                  AND e.status = 'success'
+                  AND """ + _hidden_brand_not_exists_clause(workspace_expr="wa.workspace_id", brand_expr="a.brand") + """
+            ),
+            categories AS (
+                SELECT DISTINCT
+                    e.library_id,
+                    btrim(split.split_category) AS category
+                FROM successful_extractions e
+                CROSS JOIN LATERAL unnest(COALESCE(e.hooking_categories, '{}'::text[])) AS raw(category_value)
+                CROSS JOIN LATERAL regexp_split_to_table(raw.category_value, '\\s*,\\s*') AS split(split_category)
+            )
+            SELECT
+                category,
+                COUNT(DISTINCT library_id)::int AS count
+            FROM categories
+            WHERE category IS NOT NULL
+              AND category <> ''
+            GROUP BY category
+            ORDER BY count DESC, category ASC
+            """,
+            (workspace_id,),
+        ).fetchall()
+
+        # 2. For each category, prefetch representative ads for the collapsed view/expand handoff.
+        items = []
+        for row in categories_rows:
+            category = row["category"]
+            ads = conn.execute(
+                """
+                WITH category_members AS (
+                    SELECT DISTINCT e.library_id
+                    FROM workspace_meta_ads wa
+                    JOIN meta_ads a ON a.library_id = wa.library_id
+                    JOIN meta_ad_video_extractions e ON e.library_id = wa.library_id
+                    CROSS JOIN LATERAL unnest(COALESCE(e.hooking_categories, '{}'::text[])) AS raw(category_value)
+                    CROSS JOIN LATERAL regexp_split_to_table(raw.category_value, '\\s*,\\s*') AS split(split_category)
+                    WHERE wa.workspace_id = %s
+                      AND e.status = 'success'
+                      AND """ + _hidden_brand_not_exists_clause(workspace_expr="wa.workspace_id", brand_expr="a.brand") + """
+                      AND btrim(split.split_category) = %s
+                )
+                SELECT 
+                    a.library_id, 
+                    a.brand,
+                    a.brand_logo_url,
+                    a.body,
+                    a.start_date,
+                    a.status,
+                    COALESCE(i.url, v.url) AS thumbnail_url
+                FROM workspace_meta_ads wa
+                JOIN meta_ads a ON a.library_id = wa.library_id
+                JOIN meta_ad_video_extractions e ON e.library_id = a.library_id
+                LEFT JOIN LATERAL (
+                    SELECT url FROM meta_ad_media 
+                    WHERE library_id = a.library_id AND media_type = 'video' LIMIT 1
+                ) v ON true
+                LEFT JOIN LATERAL (
+                    SELECT url FROM meta_ad_media 
+                    WHERE library_id = a.library_id AND media_type = 'image' ORDER BY id ASC LIMIT 1
+                ) i ON true
+                JOIN category_members cm ON cm.library_id = a.library_id
+                ORDER BY a.start_date DESC, a.library_id DESC
+                LIMIT 10
+                """,
+                (workspace_id, category),
+            ).fetchall()
+            
+            items.append({
+                "category": category,
+                "count": row["count"],
+                "ads": ads
+            })
+
+    return {"items": items}
+
+
+@app.get("/api/creative-composition/category-ads/{category}")
+def category_ads(category: str, request: Request, page: int = 1, limit: int = 40) -> dict[str, Any]:
+    offset = (page - 1) * limit
+    with _connect() as conn:
+        ctx = _workspace_context(request, conn)
+        workspace_id = ctx["workspace_id"]
+
+        rows = conn.execute(
+            """
+            WITH category_members AS (
+                SELECT DISTINCT e.library_id
+                FROM workspace_meta_ads wa
+                JOIN meta_ads a ON a.library_id = wa.library_id
+                JOIN meta_ad_video_extractions e ON e.library_id = wa.library_id
+                CROSS JOIN LATERAL unnest(COALESCE(e.hooking_categories, '{}'::text[])) AS raw(category_value)
+                CROSS JOIN LATERAL regexp_split_to_table(raw.category_value, '\\s*,\\s*') AS split(split_category)
+                WHERE wa.workspace_id = %s
+                  AND e.status = 'success'
+                  AND """ + _hidden_brand_not_exists_clause(workspace_expr="wa.workspace_id", brand_expr="a.brand") + """
+                  AND btrim(split.split_category) = %s
+            )
+            SELECT 
+                a.library_id, 
+                a.brand,
+                a.brand_logo_url,
+                a.body,
+                a.start_date,
+                a.status,
+                COALESCE(i.url, v.url) AS thumbnail_url
+            FROM workspace_meta_ads wa
+            JOIN meta_ads a ON a.library_id = wa.library_id
+            JOIN meta_ad_video_extractions e ON e.library_id = a.library_id
+            LEFT JOIN LATERAL (
+                SELECT url FROM meta_ad_media 
+                WHERE library_id = a.library_id AND media_type = 'video' LIMIT 1
+            ) v ON true
+            LEFT JOIN LATERAL (
+                SELECT url FROM meta_ad_media 
+                WHERE library_id = a.library_id AND media_type = 'image' ORDER BY id ASC LIMIT 1
+            ) i ON true
+            JOIN category_members cm ON cm.library_id = a.library_id
+            ORDER BY a.start_date DESC, a.library_id DESC
+            LIMIT %s OFFSET %s
+            """,
+            (workspace_id, category, limit, offset),
+        ).fetchall()
+
+    return {"items": rows}
+
+
 @app.post("/api/meta/brand-search")
 async def brand_search(payload: BrandSearchRequest, request: Request) -> dict[str, Any]:
     with _connect() as conn:
@@ -555,7 +894,6 @@ async def brand_search(payload: BrandSearchRequest, request: Request) -> dict[st
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"query": payload.query, "count": len(brands), "brands": brands}
-
 
 @app.post("/api/folders")
 def create_folder(payload: FolderCreateRequest, request: Request) -> dict[str, Any]:
@@ -676,15 +1014,25 @@ def create_competitors(payload: CompetitorCreateRequest, request: Request, backg
             if not exists:
                 raise HTTPException(status_code=404, detail="folder not found")
         for item in payload.items:
+            next_sort_order = conn.execute(
+                """
+                SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_sort_order
+                FROM competitors
+                WHERE workspace_id = %s
+                  AND folder_id IS NOT DISTINCT FROM %s
+                """,
+                (workspace_id, payload.folder_id),
+            ).fetchone()["next_sort_order"]
             row = conn.execute(
                 """
                 INSERT INTO competitors (
-                    workspace_id, folder_id, page_id, brand, brand_logo_url,
+                    workspace_id, folder_id, sort_order, page_id, brand, brand_logo_url,
                     representative_library_id, search_query, created_by_user_id, created_by_app_user_id
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (workspace_id, page_id) DO UPDATE SET
                     folder_id = EXCLUDED.folder_id,
+                    sort_order = EXCLUDED.sort_order,
                     brand = EXCLUDED.brand,
                     brand_logo_url = EXCLUDED.brand_logo_url,
                     representative_library_id = EXCLUDED.representative_library_id,
@@ -695,6 +1043,7 @@ def create_competitors(payload: CompetitorCreateRequest, request: Request, backg
                 (
                     workspace_id,
                     payload.folder_id,
+                    next_sort_order,
                     item.page_id,
                     item.brand,
                     item.brand_logo_url,
@@ -736,10 +1085,11 @@ def create_competitors(payload: CompetitorCreateRequest, request: Request, backg
 def update_competitor(competitor_id: int, payload: CompetitorPatchRequest, request: Request) -> dict[str, Any]:
     updates = []
     values: list[Any] = []
+    requested_fields = payload.model_fields_set
     if payload.monitoring_enabled is not None:
         updates.append("monitoring_enabled = %s")
         values.append(payload.monitoring_enabled)
-    if payload.folder_id is not None:
+    if "folder_id" in requested_fields:
         updates.append("folder_id = %s")
         values.append(payload.folder_id)
     if not updates:
@@ -748,13 +1098,26 @@ def update_competitor(competitor_id: int, payload: CompetitorPatchRequest, reque
         ctx = _workspace_context(request, conn)
         _require_write_role(ctx)
         workspace_id = ctx["workspace_id"]
-        if payload.folder_id is not None:
+        if "folder_id" in requested_fields and payload.folder_id is not None:
             exists = conn.execute(
                 "SELECT 1 FROM folders WHERE id = %s AND workspace_id = %s",
                 (payload.folder_id, workspace_id),
             ).fetchone()
             if not exists:
                 raise HTTPException(status_code=404, detail="folder not found")
+        if "folder_id" in requested_fields:
+            next_sort_order = conn.execute(
+                """
+                SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_sort_order
+                FROM competitors
+                WHERE workspace_id = %s
+                  AND folder_id IS NOT DISTINCT FROM %s
+                  AND id <> %s
+                """,
+                (workspace_id, payload.folder_id, competitor_id),
+            ).fetchone()["next_sort_order"]
+            updates.append("sort_order = %s")
+            values.append(next_sort_order)
         values.extend([competitor_id, workspace_id])
         row = conn.execute(
             f"""
@@ -769,6 +1132,34 @@ def update_competitor(competitor_id: int, payload: CompetitorPatchRequest, reque
     if not row:
         raise HTTPException(status_code=404, detail="competitor not found")
     return {"competitor": row}
+
+
+@app.post("/api/competitors/reorder")
+def reorder_competitors(payload: CompetitorReorderRequest, request: Request) -> dict[str, Any]:
+    with _connect() as conn:
+        ctx = _workspace_context(request, conn)
+        _require_write_role(ctx)
+        workspace_id = ctx["workspace_id"]
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM competitors
+            WHERE workspace_id = %s
+              AND folder_id IS NOT DISTINCT FROM %s
+            """,
+            (workspace_id, payload.folder_id),
+        ).fetchall()
+        existing_ids = {row["id"] for row in rows}
+        requested_ids = set(payload.competitor_ids)
+        if existing_ids != requested_ids:
+            raise HTTPException(status_code=400, detail="competitor_ids must match the target folder contents")
+        for index, competitor_id in enumerate(payload.competitor_ids):
+            conn.execute(
+                "UPDATE competitors SET sort_order = %s, updated_at = now() WHERE id = %s AND workspace_id = %s",
+                (index, competitor_id, workspace_id),
+            )
+        conn.commit()
+    return {"ok": True}
 
 
 @app.delete("/api/competitors/{competitor_id}")
@@ -871,9 +1262,10 @@ def get_ad_detail(library_id: str, request: Request) -> dict[str, Any]:
                 ORDER BY created_at DESC
                 LIMIT 1
             ) ig ON true
-            WHERE a.library_id = %s OR a.library_id = TRIM(%s)
+            WHERE (a.library_id = %s OR a.library_id = TRIM(%s))
+              AND """ + _hidden_brand_not_exists_clause(workspace_expr="%s", brand_expr="a.brand") + """
             """,
-            (workspace_id, workspace_id, library_id, library_id),
+            (workspace_id, workspace_id, library_id, library_id, workspace_id),
         ).fetchone()
 
         if not ad:
@@ -899,14 +1291,21 @@ def get_ad_detail(library_id: str, request: Request) -> dict[str, Any]:
                 + _library_id_values(ad.get("similar_library_ids"))
             )
         )
+        # 현재 광고 본인은 제외
+        if library_id in variation_ids:
+            variation_ids.remove(library_id)
+            
         if variation_ids:
             variation_rows = conn.execute(
                 """
                 SELECT 
-                    a.library_id, a.status, a.start_date, a.page_id,
+                    a.library_id, a.status, a.start_date, a.start_date_text, a.page_id, a.brand, a.brand_logo_url,
                     v.video_url,
                     i.url as image_url,
-                    COALESCE(i.url, v.video_url) as thumbnail_url
+                    COALESCE(i.url, v.video_url) as thumbnail_url,
+                    ig.like_count AS instagram_like_count,
+                    ig.comments_count AS instagram_comments_count,
+                    ig.view_count AS instagram_view_count
                 FROM meta_ads a
                 LEFT JOIN LATERAL (
                     SELECT url as video_url
@@ -921,17 +1320,167 @@ def get_ad_detail(library_id: str, request: Request) -> dict[str, Any]:
                     ORDER BY id ASC
                     LIMIT 1
                 ) i ON true
+                LEFT JOIN LATERAL (
+                    SELECT like_count, comments_count, view_count
+                    FROM meta_ad_instagram_metric_snapshots
+                    WHERE library_id = a.library_id
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                ) ig ON true
                 WHERE a.library_id = ANY(%s)
+                  AND """ + _hidden_brand_not_exists_clause(workspace_expr="%s", brand_expr="a.brand") + """
                 """,
-                (variation_ids,),
+                (variation_ids, workspace_id),
             ).fetchall()
             variations = variation_rows
+
+        metric_history = conn.execute(
+            """
+            SELECT
+                created_at,
+                like_count,
+                comments_count,
+                view_count
+            FROM meta_ad_instagram_metric_snapshots
+            WHERE library_id = %s
+              AND match_status = 'matched'
+            ORDER BY created_at ASC
+            """,
+            (library_id,),
+        ).fetchall()
 
     return {
         "ad": ad,
         "extractions": extractions,
-        "variations": variations
+        "variations": variations,
+        "metric_history": metric_history,
     }
+
+
+@app.get("/api/ads/{library_id}/media-download")
+async def download_ad_media(library_id: str, request: Request) -> Response:
+    with _connect() as conn:
+        ctx = _workspace_context(request, conn)
+        workspace_id = ctx["workspace_id"]
+        ad = conn.execute(
+            """
+            SELECT
+                a.library_id,
+                a.brand,
+                COALESCE(i.url, v.url) AS media_url,
+                v.url AS video_url
+            FROM meta_ads a
+            LEFT JOIN LATERAL (
+                SELECT url
+                FROM meta_ad_media
+                WHERE library_id = a.library_id AND media_type = 'video'
+                LIMIT 1
+            ) v ON true
+            LEFT JOIN LATERAL (
+                SELECT url
+                FROM meta_ad_media
+                WHERE library_id = a.library_id AND media_type = 'image'
+                ORDER BY id ASC
+                LIMIT 1
+            ) i ON true
+            WHERE (a.library_id = %s OR a.library_id = TRIM(%s))
+              AND """ + _hidden_brand_not_exists_clause(workspace_expr="%s", brand_expr="a.brand") + """
+            LIMIT 1
+            """,
+            (library_id, library_id, workspace_id),
+        ).fetchone()
+
+    if not ad:
+        raise HTTPException(status_code=404, detail="ad not found")
+
+    media_url = (ad.get("video_url") or ad.get("media_url") or "").strip()
+    if not media_url:
+        raise HTTPException(status_code=404, detail="media not found")
+
+    is_video = bool(ad.get("video_url"))
+    fallback_ext = ".mp4" if is_video else ".jpg"
+    base_name = _sanitize_download_name(
+        f"{ad.get('brand') or 'ad'}_{ad.get('library_id') or library_id}",
+        "ad_media",
+    )
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+            upstream = await client.get(media_url)
+            upstream.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="failed to download upstream media") from exc
+
+    content_type = upstream.headers.get("content-type", "application/octet-stream")
+    extension = _guess_extension_from_url_or_type(media_url, content_type, fallback_ext)
+    filename = f"{base_name}{extension}"
+    encoded_filename = quote(filename)
+
+    return Response(
+        content=upstream.content,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
+        },
+    )
+
+
+@app.post("/api/ads/batch")
+def get_ads_batch(payload: List[str], request: Request) -> dict[str, Any]:
+    if not payload:
+        return {"items": []}
+    
+    with _connect() as conn:
+        ctx = _workspace_context(request, conn)
+        workspace_id = ctx["workspace_id"]
+        
+        rows = conn.execute(
+            """
+            SELECT
+                a.library_id, wa.competitor_id, a.page_id, a.brand, a.brand_logo_url,
+                wa.status, a.body, a.link_title, a.link_url, a.start_date_text,
+                a.start_date, a.ad_format, a.meta_library_url,
+                e.hooking_audio, e.hooking_screen_text,
+                wa.first_seen_at, wa.last_seen_at,
+                EXISTS (
+                    SELECT 1 FROM saved_ads s
+                    WHERE s.workspace_id = %s AND s.library_id = a.library_id
+                ) AS saved,
+                COALESCE(i.url, v.url) AS media_url,
+                i.url AS thumbnail_url,
+                v.url AS video_url,
+                v.duration_seconds,
+                CASE
+                    WHEN v.url IS NOT NULL THEN 'video'
+                    WHEN i.url IS NOT NULL THEN 'image'
+                    ELSE a.ad_format
+                END AS media_type
+            FROM meta_ads a
+            LEFT JOIN workspace_meta_ads wa ON wa.library_id = a.library_id AND wa.workspace_id = %s
+            LEFT JOIN LATERAL (
+                SELECT hooking_audio, hooking_screen_text
+                FROM meta_ad_video_extractions
+                WHERE library_id = a.library_id
+                  AND status = 'success'
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) e ON true
+            LEFT JOIN LATERAL (
+                SELECT url, duration_seconds FROM meta_ad_media 
+                WHERE library_id = a.library_id AND media_type = 'video' LIMIT 1
+            ) v ON true
+            LEFT JOIN LATERAL (
+                SELECT url FROM meta_ad_media 
+                WHERE library_id = a.library_id AND media_type = 'image' ORDER BY id ASC LIMIT 1
+            ) i ON true
+            WHERE a.library_id = ANY(%s)
+              AND """ + _hidden_brand_not_exists_clause(workspace_expr="%s", brand_expr="a.brand") + """
+            ORDER BY a.start_date DESC
+            """,
+            (workspace_id, workspace_id, payload, workspace_id),
+        ).fetchall()
+
+    return {"items": rows}
 
 
 @app.get("/api/auth-config")
@@ -941,6 +1490,201 @@ def auth_config() -> dict[str, Any]:
         "publishable_key": os.getenv("CLERK_PUBLISHABLE_KEY", "").strip()
         or os.getenv("NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY", "").strip(),
     }
+
+
+@app.get("/api/analysis/hooking-subtypes/{category}")
+def get_hooking_subtypes(category: str, request: Request) -> dict[str, Any]:
+    with _connect() as conn:
+        ctx = _workspace_context(request, conn)
+        workspace_id = ctx["workspace_id"]
+        
+        # 1. 캐시 확인 (1일 이내 데이터)
+        cache = conn.execute(
+            """
+            SELECT result_json
+            FROM hooking_analysis_cache
+            WHERE workspace_id = %s
+              AND category = %s
+              AND updated_at > now() - interval '1 days'
+            """,
+            (workspace_id, category),
+        ).fetchone()
+        
+        if cache:
+            return cache["result_json"]
+
+        # 2. 데이터 수집 (카테고리 일치하는 광고의 후킹 텍스트)
+        rows = _hooking_category_member_rows(conn, workspace_id=workspace_id, category=category)
+
+        if not rows:
+            return {"total_count": 0, "items": []}
+
+        # 3. 데이터 전처리 및 후킹 텍스트 추출
+        texts = []
+        library_ids = []
+        valid_rows = []
+        
+        for row in rows:
+            h_audio = row["hooking_audio"] or []
+            h_screen = row["hooking_screen_text"] or []
+            t_list = [t.get("text", "") for t in h_audio if t.get("text")]
+            if not t_list:
+                t_list = [t.get("text", "") for t in h_screen if t.get("text")]
+            
+            hook_text = " ".join(t_list).strip()
+            if not hook_text:
+                continue
+                
+            texts.append(hook_text)
+            library_ids.append(row["library_id"])
+            valid_rows.append(row)
+
+        if not texts:
+            return {"total_count": len(rows), "items": []}
+
+        # 4. 실시간 Batch Embedding (후킹 텍스트만, 최대 100개씩 나눠서 요청)
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_api_key:
+            return {"total_count": len(rows), "items": []}
+            
+        client = genai.Client(api_key=gemini_api_key)
+        
+        try:
+            embeddings = []
+            # Gemini Batch Embedding limit is 100
+            for i in range(0, len(texts), 100):
+                batch_texts = texts[i:i+100]
+                emb_res = client.models.embed_content(
+                    model="models/gemini-embedding-001",
+                    contents=batch_texts
+                )
+                embeddings.extend([e.values for e in emb_res.embeddings])
+        except Exception as e:
+            logger.error("Batch embedding failed: %s", e)
+            return {"total_count": len(rows), "items": []}
+
+        X = np.array(embeddings)
+        n_clusters = min(10, len(valid_rows))
+        
+        # 5. K-Means 클러스터링
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(X)
+
+        # 6. 군집별 정보 수집
+        all_samples_text = ""
+        cluster_base_info = []
+
+        for i in range(n_clusters):
+            idx = np.where(labels == i)[0]
+            if len(idx) == 0: continue
+            
+            group_library_ids = [library_ids[j] for j in idx]
+            
+            # 중심점 대표 문구
+            centroid = kmeans.cluster_centers_[i]
+            dists = np.linalg.norm(X[idx] - centroid, axis=1)
+            rep_idx_local = np.argmin(dists)
+            rep_text = texts[idx[rep_idx_local]]
+            
+            group_texts = [texts[j] for j in idx]
+            samples = "\n".join([f"  * {s}" for s in group_texts[:8]])
+            
+            all_samples_text += f"\n[그룹 {i+1}]\n{samples}\n"
+            cluster_base_info.append({
+                "id": i,
+                "rep_text": rep_text,
+                "count": len(idx),
+                "library_ids": group_library_ids
+            })
+
+        # 6. 모든 그룹을 한꺼번에 Gemini에게 전달하여 중복 없는 이름 짓기
+        class ClusterNaming(BaseModel):
+            type_name: str
+            reason: str
+
+        class AllClusterNames(BaseModel):
+            names: list[ClusterNaming]
+
+        naming_prompt = f"""당신은 세계적인 마케팅 전략가입니다. 
+다음은 특정 카테고리('{category}') 내에서 다시 10개의 세부 그룹으로 분류된 광고 문구들입니다.
+각 그룹이 가진 '독특한 소구점'이나 '심리적 기법'을 분석하여, **서로 절대 중복되지 않는** 10개의 고유한 유형 이름을 지어주세요.
+
+[작성 규칙]
+1. 이름은 반드시 '~형'으로 끝나야 합니다. (예: '위협형', '공감 유도형', '후회형', '효과 강조형', '경험 공유형', '이벤트형' 등)
+2. 10개 그룹의 이름은 서로 의미가 겹치지 않고 명확히 구별되어야 합니다.
+3. 각 그룹의 특징을 가장 잘 설명하는 단어를 선택하세요.
+4. 광고의 상세 내용(제품유형, 솔루션 등) 자체가 아닌 후킹 메커니즘을 분석하세요.
+
+[광고 그룹 데이터]
+{all_samples_text}
+"""
+        
+        cluster_info = []
+        try:
+            res = client.models.generate_content(
+                model="gemini-2.5-flash-lite", 
+                contents=naming_prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=AllClusterNames,
+                    temperature=0.2,
+                    safety_settings=[
+                        types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+                        types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+                        types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+                        types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+                    ]
+                )
+            )
+            
+            parsed_names = res.parsed.names if res.parsed else []
+            
+            for i, base in enumerate(cluster_base_info):
+                name_data = parsed_names[i] if i < len(parsed_names) else None
+                type_name = name_data.type_name if name_data else f"분석 유형 {i+1}"
+                
+                cluster_info.append({
+                    "rank": i + 1,
+                    "type_name": type_name,
+                    "representative_text": base["rep_text"],
+                    "count": base["count"],
+                    "library_ids": base["library_ids"]
+                })
+        except Exception as e:
+            logger.error("Global cluster naming failed: %s", e, exc_info=True)
+            for i, base in enumerate(cluster_base_info):
+                cluster_info.append({
+                    "rank": i + 1,
+                    "type_name": f"유형 {i+1}",
+                    "representative_text": base["rep_text"],
+                    "count": base["count"],
+                    "library_ids": base["library_ids"]
+                })
+
+        # 7. count 기준 정렬
+        cluster_info.sort(key=lambda x: x["count"], reverse=True)
+        for i, info in enumerate(cluster_info):
+            info["rank"] = i + 1
+
+        result = {
+            "total_count": len(rows),
+            "items": cluster_info
+        }
+
+        # 8. 캐시 저장
+        conn.execute(
+            """
+            INSERT INTO hooking_analysis_cache (workspace_id, category, result_json, updated_at)
+            VALUES (%s, %s, %s, now())
+            ON CONFLICT (workspace_id, category) DO UPDATE SET
+                result_json = EXCLUDED.result_json,
+                updated_at = now()
+            """,
+            (workspace_id, category, json.dumps(result))
+        )
+        conn.commit()
+
+        return result
 
 
 if __name__ == "__main__":
