@@ -10,7 +10,7 @@ import sys
 import time
 from datetime import datetime
 from html import unescape
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, quote, urlparse, unquote
 
 from scrapling.fetchers import AsyncStealthySession, StealthyFetcher
@@ -675,6 +675,58 @@ def _session_user_data_dir_from_env() -> Optional[str]:
     return value or None
 
 
+def _resource_blocking_enabled() -> bool:
+    value = os.getenv("META_ADS_BLOCK_RESOURCES", "true").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _blocked_domains_for_session() -> Optional[set[str]]:
+    if not _resource_blocking_enabled():
+        return None
+    raw = os.getenv("META_ADS_BLOCKED_DOMAINS", "fna.fbcdn.net").strip()
+    if not raw:
+        return None
+    values = {
+        domain.strip().lower()
+        for domain in raw.split(",")
+        if domain.strip()
+    }
+    return values or None
+
+
+def _build_blocked_domains_page_setup() -> Optional[Callable[[Any], Awaitable[None]]]:
+    blocked_domains = _blocked_domains_for_session()
+    if not blocked_domains:
+        return None
+
+    async def _page_setup(page: Any) -> None:
+        context = getattr(page, "context", None)
+        if context is None:
+            return
+        if getattr(context, "_meta_ads_blocked_domains_applied", False):
+            return
+
+        async def _route_handler(route: Any) -> None:
+            try:
+                request = getattr(route, "request", None)
+                request_url = str(getattr(request, "url", "") or "")
+                hostname = str(urlparse(request_url).hostname or "").strip().lower()
+                if any(hostname == domain or hostname.endswith("." + domain) for domain in blocked_domains):
+                    await route.abort()
+                    return
+                await route.continue_()
+            except Exception:
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+        await context.route("**/*", _route_handler)
+        setattr(context, "_meta_ads_blocked_domains_applied", True)
+
+    return _page_setup
+
+
 def _apply_session_env_options(session_config: Dict[str, Any]) -> None:
     proxy_url = _session_proxy_from_env()
     if proxy_url:
@@ -682,6 +734,12 @@ def _apply_session_env_options(session_config: Dict[str, Any]) -> None:
     user_data_dir = _session_user_data_dir_from_env()
     if user_data_dir:
         session_config["user_data_dir"] = user_data_dir
+    if _resource_blocking_enabled():
+        session_config["disable_resources"] = True
+        blocked_domains = _blocked_domains_for_session()
+        if blocked_domains:
+            session_config["blocked_domains"] = blocked_domains
+            session_config["page_setup"] = _build_blocked_domains_page_setup()
 
 
 def _network_kind(url: str) -> str:
