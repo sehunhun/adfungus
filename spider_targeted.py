@@ -36,7 +36,7 @@ from meta_ads_crawler import (
 LOGGER = logging.getLogger("spider-targeted")
 
 # 타겟팅할 브랜드의 competitor ID 목록
-TARGET_IDS = [14, 31, 90, 79, 80, 88, 89, 82, 84, 85, 87, 91, 92, 86, 93, 97, 98]
+TARGET_IDS = [102] # [14, 31, 90, 79, 80, 88, 89, 82, 84, 85, 87, 91, 92, 86, 93, 97, 98, 102, 103]
 
 
 class TargetedAdFungusSpider(AdFungusSpider):
@@ -193,7 +193,7 @@ def main(argv: list[str] | None = None):
         job_id=job_id,
     )
     LOGGER.info("targeted spider job_id=%s", job_id)
-    spider.start(concurrency=3, engine="stealthy")
+    spider.start(concurrency=1, engine="stealthy")
 
     elapsed = time.perf_counter() - start_time
     LOGGER.info(f"--- Spider Crawl Finished in {elapsed:.2f} seconds ---")

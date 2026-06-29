@@ -56,7 +56,13 @@ def build_ads_library_search_url(query: str, country: str = "KR") -> str:
     normalized_country = re.sub(r"[^A-Za-z]", "", _clean(country)).upper() or "KR"
     return (
         "https://www.facebook.com/ads/library/?active_status=active&ad_type=all"
-        f"&country={normalized_country}&q={quote(_clean(query))}"
+        f"&country={normalized_country}"
+        "&is_targeted_country=false"
+        "&media_type=all"
+        f"&q={quote(_clean(query))}"
+        "&search_type=keyword_unordered"
+        "&sort_data[mode]=relevancy_monthly_grouped"
+        "&sort_data[direction]=desc"
     )
 
 
