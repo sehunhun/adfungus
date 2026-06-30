@@ -179,7 +179,7 @@ def main(argv: list[str] | None = None):
     os.environ["META_ADS_REAL_CHROME"] = (
         "true"  # (옵션) Headless 해제하고 싶으면 False로 변경
     )
-    os.environ["HEADLESS"] = "false"
+    os.environ["HEADLESS"] = "true"
     os.environ["FETCH_RETRIES"] = "1"
     os.environ["CHALLENGE_WAIT_MS"] = "90000"
 

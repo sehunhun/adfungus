@@ -680,10 +680,17 @@ def _resource_blocking_enabled() -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def _session_additional_args_from_env() -> Dict[str, Any]:
+    args: Dict[str, Any] = {}
+    if _resource_blocking_enabled():
+        args["service_workers"] = "block"
+    return args
+
+
 def _blocked_domains_for_session() -> Optional[set[str]]:
     if not _resource_blocking_enabled():
         return None
-    raw = os.getenv("META_ADS_BLOCKED_DOMAINS", "fna.fbcdn.net").strip()
+    raw = os.getenv("META_ADS_BLOCKED_DOMAINS", "fbcdn.net").strip()
     if not raw:
         return None
     values = {
@@ -694,9 +701,21 @@ def _blocked_domains_for_session() -> Optional[set[str]]:
     return values or None
 
 
+def _should_abort_media_request(hostname: str, blocked_domains: Optional[set[str]] = None) -> bool:
+    normalized = hostname.strip().lower()
+    if not normalized:
+        return False
+    if normalized.startswith("video") and normalized.endswith(".fbcdn.net"):
+        return True
+    for domain in blocked_domains or set():
+        if normalized == domain or normalized.endswith("." + domain):
+            return True
+    return False
+
+
 def _build_blocked_domains_page_setup() -> Optional[Callable[[Any], Awaitable[None]]]:
     blocked_domains = _blocked_domains_for_session()
-    if not blocked_domains:
+    if not _resource_blocking_enabled():
         return None
 
     async def _page_setup(page: Any) -> None:
@@ -711,7 +730,7 @@ def _build_blocked_domains_page_setup() -> Optional[Callable[[Any], Awaitable[No
                 request = getattr(route, "request", None)
                 request_url = str(getattr(request, "url", "") or "")
                 hostname = str(urlparse(request_url).hostname or "").strip().lower()
-                if any(hostname == domain or hostname.endswith("." + domain) for domain in blocked_domains):
+                if _should_abort_media_request(hostname, blocked_domains):
                     await route.abort()
                     return
                 await route.continue_()
@@ -734,12 +753,16 @@ def _apply_session_env_options(session_config: Dict[str, Any]) -> None:
     user_data_dir = _session_user_data_dir_from_env()
     if user_data_dir:
         session_config["user_data_dir"] = user_data_dir
+    additional_args = dict(session_config.get("additional_args") or {})
+    additional_args.update(_session_additional_args_from_env())
+    if additional_args:
+        session_config["additional_args"] = additional_args
     if _resource_blocking_enabled():
         session_config["disable_resources"] = True
         blocked_domains = _blocked_domains_for_session()
         if blocked_domains:
             session_config["blocked_domains"] = blocked_domains
-            session_config["page_setup"] = _build_blocked_domains_page_setup()
+        session_config["page_setup"] = _build_blocked_domains_page_setup()
 
 
 def _network_kind(url: str) -> str:
