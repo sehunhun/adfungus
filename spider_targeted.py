@@ -35,12 +35,40 @@ from meta_ads_crawler import (
 
 LOGGER = logging.getLogger("spider-targeted")
 
+DEFAULT_TARGET_IDS = [14, 31, 79, 80, 82, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 97, 98, 102, 103]
+
+
+def _target_ids_from_env() -> list[int]:
+    raw = os.getenv("TARGET_IDS", "").strip()
+    if not raw:
+        return list(DEFAULT_TARGET_IDS)
+
+    values: list[int] = []
+    for chunk in raw.split(","):
+        text = chunk.strip()
+        if not text:
+            continue
+        try:
+            values.append(int(text))
+        except ValueError:
+            LOGGER.warning("Ignoring invalid TARGET_IDS entry: %r", text)
+
+    if values:
+        return values
+
+    LOGGER.warning("TARGET_IDS was set but no valid integers were found; using defaults")
+    return list(DEFAULT_TARGET_IDS)
+
 # 타겟팅할 브랜드의 competitor ID 목록
-TARGET_IDS = [102] # [14, 31, 90, 79, 80, 88, 89, 82, 84, 85, 87, 91, 92, 86, 93, 97, 98, 102, 103]
+TARGET_IDS = list(DEFAULT_TARGET_IDS)
 
 
 class TargetedAdFungusSpider(AdFungusSpider):
     name = "targeted_spider"
+
+    def __init__(self, *args, target_ids: list[int] | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.target_ids = list(target_ids or DEFAULT_TARGET_IDS)
 
     async def start_requests(self):
         # 지정된 ID만 DB에서 가져오도록 수정
@@ -53,7 +81,7 @@ class TargetedAdFungusSpider(AdFungusSpider):
                     WHERE id = ANY(%s)
                     ORDER BY created_at ASC
                     """,
-                    (TARGET_IDS,),
+                    (self.target_ids,),
                 )
                 competitors = cur.fetchall()
 
@@ -172,6 +200,7 @@ def main(argv: list[str] | None = None):
     _load_local_env()
     _setup_logging()
     database_url = _database_url()
+    target_ids = _target_ids_from_env()
 
     # 환경 변수를 무시하고 로컬 강제 설정 적용
     os.environ["LIMIT"] = "0"  # 무제한
@@ -183,7 +212,8 @@ def main(argv: list[str] | None = None):
     os.environ["FETCH_RETRIES"] = "1"
     os.environ["CHALLENGE_WAIT_MS"] = "90000"
 
-    LOGGER.info("--- Starting Targeted Spider Crawl (%s Brands) ---", len(TARGET_IDS))
+    LOGGER.info("--- Starting Targeted Spider Crawl (%s Brands) ---", len(target_ids))
+    LOGGER.info("targeted spider target_ids=%s", target_ids)
     start_time = time.perf_counter()
 
     job_id = uuid.uuid4().hex
@@ -191,6 +221,7 @@ def main(argv: list[str] | None = None):
         database_url=database_url,
         run_gemini=not args.no_gemini,
         job_id=job_id,
+        target_ids=target_ids,
     )
     LOGGER.info("targeted spider job_id=%s", job_id)
     spider.start(concurrency=1, engine="stealthy")

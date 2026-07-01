@@ -308,11 +308,26 @@ CREATE INDEX IF NOT EXISTS idx_meta_ad_instagram_metric_snapshots_library_create
 
 
 def _setup_logging() -> None:
+    debug_enabled = _debug_enabled()
+    level_name = _log_level_name()
     logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        level=level_name,
         format="[%(asctime)s] %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+def _log_level_name() -> str:
+    legacy_debug = os.getenv("DEBUG", "").strip().lower() in {"1", "true", "yes"}
+    return os.getenv("LOG_LEVEL", "").strip().upper() or ("DEBUG" if legacy_debug else "INFO")
+
+
+def _debug_enabled() -> bool:
+    level_name = _log_level_name()
+    level_value = logging.getLevelName(level_name)
+    if isinstance(level_value, int):
+        return level_value <= logging.DEBUG
+    return False
 
 
 def _load_local_env() -> None:
@@ -719,7 +734,7 @@ def _fill_new_ad_influencer_instagram_usernames(ads: List[Dict[str, Any]]) -> Di
             country=os.getenv("META_ADS_SEARCH_COUNTRY", "KR"),
             limit=max(_int_env("INFLUENCER_TYPEAHEAD_LIMIT", 10), 1),
             scroll_wait_ms=max(_int_env("SCROLL_WAIT_MS", 1200), 300),
-            debug=os.getenv("DEBUG", "").lower() in {"1", "true", "yes"},
+            debug=_debug_enabled(),
         )
     )
 
@@ -1188,7 +1203,7 @@ async def _crawl() -> tuple[str, str, List[Dict[str, Any]]]:
     ads = await crawl_meta_ads(
         url=library_url,
         scroll_wait_ms=max(_int_env("SCROLL_WAIT_MS", 1200), 300),
-        debug=os.getenv("DEBUG", "").lower() in {"1", "true", "yes"},
+        debug=_debug_enabled(),
         stable_rounds=max(_int_env("STABLE_ROUNDS", 3), 1),
         stable_max_rounds=max(_int_env("STABLE_MAX_ROUNDS", 18), 1),
         limit=max(_int_env("LIMIT", 0), 0),
@@ -1206,7 +1221,7 @@ async def _crawl_page(page_id: str, brand_name: str = "") -> tuple[str, str, Lis
     ads = await crawl_meta_ads(
         url=library_url,
         scroll_wait_ms=max(_int_env("SCROLL_WAIT_MS", 1200), 300),
-        debug=os.getenv("DEBUG", "").lower() in {"1", "true", "yes"},
+        debug=_debug_enabled(),
         stable_rounds=max(_int_env("STABLE_ROUNDS", 3), 1),
         stable_max_rounds=max(_int_env("STABLE_MAX_ROUNDS", 18), 1),
         limit=max(_int_env("LIMIT", 0), 0),

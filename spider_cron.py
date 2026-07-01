@@ -20,7 +20,7 @@ from cron_runner_old import (
     _store_existing_ad_observations, _store_ads,
     _mark_missing_ads, _finish_run,
     _process_videos_after_crawl, _process_embeddings_after_crawl,
-    SCHEMA_SQL, _ensure_default_workspace, _load_local_env
+    SCHEMA_SQL, _ensure_default_workspace, _load_local_env, _debug_enabled
 )
 from meta_ads_crawler import (
     build_ads_library_search_url, build_ads_library_url,
@@ -60,7 +60,7 @@ class AdFungusSpider(Spider):
         self.stable_rounds = max(_int_env("STABLE_ROUNDS", 3), 1)
         self.stable_max_rounds = max(_int_env("STABLE_MAX_ROUNDS", 100), 1) # Set high for full collection
         self.challenge_wait_ms = max(_int_env("CHALLENGE_WAIT_MS", 90000), 0)
-        self.debug = os.getenv("DEBUG", "").lower() in {"1", "true", "yes"}
+        self.debug = _debug_enabled()
 
     def configure_sessions(self, manager):
         session_config = {

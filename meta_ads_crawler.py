@@ -29,19 +29,35 @@ SUMMARY_DETAIL_TEXT_RE = re.compile(
 )
 
 
-def _setup_logging(debug: bool) -> None:
+def _setup_logging(debug: bool | None = None) -> None:
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
     except Exception:
         pass
 
-    level = logging.DEBUG if debug else logging.INFO
+    if debug is None:
+        level = _log_level_name()
+    else:
+        level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(
         level=level,
         format="[%(asctime)s] %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+def _log_level_name() -> str:
+    legacy_debug = os.getenv("DEBUG", "").strip().lower() in {"1", "true", "yes"}
+    return os.getenv("LOG_LEVEL", "").strip().upper() or ("DEBUG" if legacy_debug else "INFO")
+
+
+def _debug_enabled() -> bool:
+    level_name = _log_level_name()
+    level_value = logging.getLevelName(level_name)
+    if isinstance(level_value, int):
+        return level_value <= logging.DEBUG
+    return False
 
 
 def build_ads_library_url(page_id: str) -> str:
@@ -687,50 +703,34 @@ def _session_additional_args_from_env() -> Dict[str, Any]:
     return args
 
 
-def _blocked_domains_for_session() -> Optional[set[str]]:
-    if not _resource_blocking_enabled():
-        return None
-    raw = os.getenv("META_ADS_BLOCKED_DOMAINS", "fbcdn.net").strip()
-    if not raw:
-        return None
-    values = {
-        domain.strip().lower()
-        for domain in raw.split(",")
-        if domain.strip()
-    }
-    return values or None
-
-
-def _should_abort_media_request(hostname: str, blocked_domains: Optional[set[str]] = None) -> bool:
+def _should_abort_media_request(hostname: str) -> bool:
     normalized = hostname.strip().lower()
     if not normalized:
         return False
-    if normalized.startswith("video") and normalized.endswith(".fbcdn.net"):
-        return True
-    for domain in blocked_domains or set():
-        if normalized == domain or normalized.endswith("." + domain):
-            return True
-    return False
+    return normalized.startswith("video") or normalized.startswith("scontent")
 
 
 def _build_blocked_domains_page_setup() -> Optional[Callable[[Any], Awaitable[None]]]:
-    blocked_domains = _blocked_domains_for_session()
     if not _resource_blocking_enabled():
         return None
 
     async def _page_setup(page: Any) -> None:
-        context = getattr(page, "context", None)
-        if context is None:
+        if getattr(page, "_meta_ads_blocked_domains_applied", False):
             return
-        if getattr(context, "_meta_ads_blocked_domains_applied", False):
-            return
+        LOGGER.info("route-blocker-installed")
 
         async def _route_handler(route: Any) -> None:
             try:
                 request = getattr(route, "request", None)
                 request_url = str(getattr(request, "url", "") or "")
                 hostname = str(urlparse(request_url).hostname or "").strip().lower()
-                if _should_abort_media_request(hostname, blocked_domains):
+                LOGGER.info('route-seen hostname="%s" url="%s"', hostname, request_url)
+                if _should_abort_media_request(hostname):
+                    LOGGER.debug(
+                        'Custom page.route blocking request hostname="%s" url="%s"',
+                        hostname,
+                        request_url,
+                    )
                     await route.abort()
                     return
                 await route.continue_()
@@ -740,13 +740,14 @@ def _build_blocked_domains_page_setup() -> Optional[Callable[[Any], Awaitable[No
                 except Exception:
                     pass
 
-        await context.route("**/*", _route_handler)
-        setattr(context, "_meta_ads_blocked_domains_applied", True)
+        await page.route("**/*", _route_handler)
+        setattr(page, "_meta_ads_blocked_domains_applied", True)
 
     return _page_setup
 
 
 def _apply_session_env_options(session_config: Dict[str, Any]) -> None:
+    LOGGER.info("META_ADS_CRAWLER_REV=2026-06-30-2011-route-v1")
     proxy_url = _session_proxy_from_env()
     if proxy_url:
         session_config["proxy"] = proxy_url
@@ -758,10 +759,6 @@ def _apply_session_env_options(session_config: Dict[str, Any]) -> None:
     if additional_args:
         session_config["additional_args"] = additional_args
     if _resource_blocking_enabled():
-        session_config["disable_resources"] = True
-        blocked_domains = _blocked_domains_for_session()
-        if blocked_domains:
-            session_config["blocked_domains"] = blocked_domains
         session_config["page_setup"] = _build_blocked_domains_page_setup()
 
 
@@ -1426,6 +1423,38 @@ async def _close_active_dialog(page: Any) -> None:
         pass
 
 
+async def _dismiss_ad_blocker_popup(page: Any, *, debug: bool = False) -> bool:
+    adblock_markers = [
+        "Turn off ad blocker",
+        "ad blocker is enabled",
+        "광고 차단",
+    ]
+    try:
+        dialog = page.locator('div[role="dialog"]').last
+        if int(await dialog.count()) <= 0:
+            return False
+        dialog_text = _clean(await dialog.inner_text(timeout=2000))
+        lowered = dialog_text.lower()
+        if not any(marker.lower() in lowered for marker in adblock_markers):
+            return False
+
+        for text in ["Close", "OK", "닫기", "확인"]:
+            try:
+                button = dialog.get_by_text(text, exact=False).first
+                if int(await button.count()) <= 0:
+                    continue
+                await button.click(timeout=1500)
+                await page.wait_for_timeout(700)
+                if debug:
+                    LOGGER.debug("dismissed_ad_blocker_popup button_text=%s", text)
+                return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
+
 async def _extract_dialog_html(page: Any) -> str:
     selectors = ['div[role="dialog"]', '[aria-modal="true"]']
     for selector in selectors:
@@ -1811,19 +1840,37 @@ async def _collect_summary_popup_groups(
             continue
 
         try:
+            await _dismiss_ad_blocker_popup(page, debug=debug)
             await button.scroll_into_view_if_needed(timeout=3000)
             await button.click(timeout=5000)
             await page.wait_for_timeout(wait_ms)
         except Exception as exc:
-            if debug:
-                LOGGER.debug(
-                    "summary_click_failed card_index=%s library_id=%s text=%s error=%s",
-                    card_index,
-                    library_id,
-                    matched_text,
-                    exc,
-                )
-            continue
+            try:
+                await _dismiss_ad_blocker_popup(page, debug=debug)
+                handle = await button.element_handle()
+                if handle is None:
+                    raise RuntimeError("summary button element_handle is None")
+                await page.evaluate("(el) => el.click()", handle)
+                await page.wait_for_timeout(wait_ms)
+                if debug:
+                    LOGGER.debug(
+                        "summary_click_fallback_used card_index=%s library_id=%s text=%s error=%s",
+                        card_index,
+                        library_id,
+                        matched_text,
+                        exc,
+                    )
+            except Exception as fallback_exc:
+                if debug:
+                    LOGGER.debug(
+                        "summary_click_failed card_index=%s library_id=%s text=%s error=%s fallback_error=%s",
+                        card_index,
+                        library_id,
+                        matched_text,
+                        exc,
+                        fallback_exc,
+                    )
+                continue
 
         dialog_html = await _extract_dialog_html(page)
         popup_items = _parse_ads_from_html(
@@ -2110,6 +2157,8 @@ async def search_influencer_typeahead_candidates(
 
 async def _close_ads_library_overlays(page: Any) -> None:
     try:
+        if await _dismiss_ad_blocker_popup(page):
+            return
         overlay_selectors = [
             '[aria-label="닫기"]',
             '[aria-label="Close"]',

@@ -5,7 +5,6 @@
   },
   "deploy": {
     "startCommand": "python spider_targeted.py",
-    "cronSchedule": "0 17 * * *",
     "restartPolicyType": "NEVER"
   }
 }
