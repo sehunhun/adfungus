@@ -673,6 +673,82 @@ def _existing_library_ids(
         return {str(row[0]) for row in cur.fetchall()}
 
 
+def _existing_workspace_library_ids(
+    conn: psycopg.Connection[Any],
+    *,
+    workspace_id: int | None,
+    competitor_id: int | None,
+) -> set[str]:
+    if workspace_id is None or competitor_id is None:
+        return set()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT library_id
+            FROM workspace_meta_ads
+            WHERE workspace_id = %s AND competitor_id = %s
+            """,
+            (workspace_id, competitor_id),
+        )
+        return {str(row[0]) for row in cur.fetchall()}
+
+
+def _same_source_library_ids(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+
+    library_ids: List[str] = []
+    seen: set[str] = set()
+    for item in value:
+        library_id = ""
+        if isinstance(item, dict):
+            library_id = str(
+                item.get("id")
+                or item.get("libraryID")
+                or item.get("library_id")
+                or ""
+            ).strip()
+        else:
+            library_id = str(item or "").strip()
+        if library_id and library_id not in seen:
+            library_ids.append(library_id)
+            seen.add(library_id)
+    return library_ids
+
+
+def _same_source_library_ids_by_leader(
+    conn: psycopg.Connection[Any],
+    library_ids: List[str],
+) -> Dict[str, List[str]]:
+    if not library_ids:
+        return {}
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT library_id, same_source_library_ids
+            FROM meta_ads
+            WHERE library_id = ANY(%s)
+            """,
+            (library_ids,),
+        )
+        rows = cur.fetchall()
+
+    by_leader: Dict[str, List[str]] = {}
+    for row in rows:
+        leader_id = str(row[0] or "").strip()
+        if not leader_id:
+            continue
+
+        members = _same_source_library_ids(row[1])
+        if leader_id not in members:
+            members.insert(0, leader_id)
+        by_leader[leader_id] = members
+
+    return by_leader
+
+
 def _existing_influencer_instagram_usernames(
     conn: psycopg.Connection[Any],
     library_ids: List[str],
@@ -814,6 +890,76 @@ def _store_existing_ad_observations(
                 )
 
     return stored, stored_library_ids
+
+
+def _store_inferred_existing_observations(
+    conn: psycopg.Connection[Any],
+    *,
+    run_id: int,
+    library_ids: List[str],
+    workspace_id: int | None = None,
+    competitor_id: int | None = None,
+) -> tuple[int, List[str]]:
+    if not library_ids:
+        return 0, []
+
+    LOGGER.info("refreshing %d inferred existing ads for run_id=%s", len(library_ids), run_id)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE meta_ads
+            SET last_seen_run_id = %s,
+                status = 'running',
+                missing_count = 0,
+                ended_at = NULL,
+                last_seen_at = now(),
+                updated_at = now()
+            WHERE library_id = ANY(%s)
+            RETURNING library_id
+            """,
+            (run_id, library_ids),
+        )
+        touched_library_ids = [str(row[0]) for row in cur.fetchall()]
+
+        if not touched_library_ids:
+            return 0, []
+
+        cur.execute(
+            """
+            INSERT INTO meta_ad_observations (
+                run_id, library_id, active, raw_json
+            )
+            SELECT %s, library_id, active, raw_json
+            FROM meta_ads
+            WHERE library_id = ANY(%s)
+            ON CONFLICT (run_id, library_id) DO NOTHING
+            """,
+            (run_id, touched_library_ids),
+        )
+
+        if workspace_id is not None and competitor_id is not None:
+            cur.execute(
+                """
+                INSERT INTO workspace_meta_ads (
+                    workspace_id, competitor_id, library_id, first_seen_run_id, last_seen_run_id,
+                    status, missing_count, ended_at
+                )
+                SELECT %s, %s, library_id, %s, %s, 'running', 0, NULL
+                FROM meta_ads
+                WHERE library_id = ANY(%s)
+                ON CONFLICT (workspace_id, competitor_id, library_id) DO UPDATE SET
+                    last_seen_run_id = EXCLUDED.last_seen_run_id,
+                    status = 'running',
+                    missing_count = 0,
+                    ended_at = NULL,
+                    last_seen_at = now(),
+                    updated_at = now()
+                """,
+                (workspace_id, competitor_id, run_id, run_id, touched_library_ids),
+            )
+
+    return len(touched_library_ids), touched_library_ids
 
 
 def _store_ads(

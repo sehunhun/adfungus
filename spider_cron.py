@@ -17,10 +17,11 @@ from cron_runner_old import (
     _library_ids_from_ads, _existing_library_ids, _split_ads_by_existing,
     _existing_influencer_instagram_usernames, _fallback_target_ads,
     _fill_new_ad_influencer_instagram_usernames, _prepare_media_for_storage,
-    _store_existing_ad_observations, _store_ads,
+    _store_existing_ad_observations, _store_inferred_existing_observations, _store_ads,
     _mark_missing_ads, _finish_run,
     _process_videos_after_crawl, _process_embeddings_after_crawl,
-    SCHEMA_SQL, _ensure_default_workspace, _load_local_env, _debug_enabled
+    SCHEMA_SQL, _ensure_default_workspace, _load_local_env, _debug_enabled,
+    _existing_workspace_library_ids, _same_source_library_ids_by_leader,
 )
 from meta_ads_crawler import (
     build_ads_library_search_url, build_ads_library_url,
@@ -83,11 +84,17 @@ class AdFungusSpider(Spider):
             page_id = comp.get("page_id")
             competitor_id = comp["id"]
             workspace_id = comp["workspace_id"]
+            with psycopg.connect(self.database_url) as conn:
+                existing_competitor_library_ids = _existing_workspace_library_ids(
+                    conn,
+                    workspace_id=workspace_id,
+                    competitor_id=competitor_id,
+                )
             
             target_url = build_ads_library_search_url(brand) if brand else build_ads_library_url(page_id)
             
             # We use a factory to bind closure variables properly
-            def make_page_action(limit_val, stable_max_rounds_val, scroll_wait_ms_val, stable_rounds_val, debug_val):
+            def make_page_action(limit_val, stable_max_rounds_val, scroll_wait_ms_val, stable_rounds_val, debug_val, skip_library_ids):
                 popup_groups = []
                 async def page_action(page: Any) -> None:
                     ready_state = await _wait_for_ads_library_ready(
@@ -106,12 +113,25 @@ class AdFungusSpider(Spider):
                         await _wait_until_stable_cards(page, selector=AD_CARD_SELECTOR, stable_rounds=stable_rounds_val, max_rounds=stable_max_rounds_val, wait_ms=scroll_wait_ms_val, debug=debug_val)
                     
                     popup_groups.extend(
-                        await _collect_summary_popup_groups(page, debug=debug_val, limit=limit_val, wait_ms=scroll_wait_ms_val)
+                        await _collect_summary_popup_groups(
+                            page,
+                            debug=debug_val,
+                            limit=limit_val,
+                            wait_ms=scroll_wait_ms_val,
+                            skip_library_ids=skip_library_ids,
+                        )
                     )
                     await page.wait_for_timeout(1500)
                 return page_action, popup_groups
 
-            page_action, popup_groups = make_page_action(self.limit, self.stable_max_rounds, self.scroll_wait_ms, self.stable_rounds, self.debug)
+            page_action, popup_groups = make_page_action(
+                self.limit,
+                self.stable_max_rounds,
+                self.scroll_wait_ms,
+                self.stable_rounds,
+                self.debug,
+                existing_competitor_library_ids,
+            )
 
             LOGGER.info(f"[*] Queuing request for {brand} (ID: {competitor_id})")
             
@@ -135,7 +155,8 @@ class AdFungusSpider(Spider):
                     "competitor_id": competitor_id,
                     "workspace_id": workspace_id,
                     "run_id": run_id,
-                    "popup_groups": popup_groups
+                    "popup_groups": popup_groups,
+                    "existing_competitor_library_ids": sorted(existing_competitor_library_ids),
                 },
                 page_action=page_action,
                 timeout=120000,
@@ -164,21 +185,41 @@ class AdFungusSpider(Spider):
         ads = _merge_same_source_groups(parsed, popup_groups, debug=self.debug)
 
         # Offload CPU/IO blocking tasks to thread pool
-        await asyncio.to_thread(self.process_ads, ads, meta)
+        await asyncio.to_thread(self.process_ads, parsed, ads, meta)
         yield {"brand": brand, "processed": True}
 
-    def process_ads(self, ads, meta):
+    def process_ads(self, main_ads, ads, meta):
         brand = meta["brand"]
         page_id = meta["page_id"]
         competitor_id = meta["competitor_id"]
         workspace_id = meta["workspace_id"]
         run_id = meta["run_id"]
+        existing_competitor_library_ids = {
+            str(value) for value in meta.get("existing_competitor_library_ids", []) if value
+        }
 
         try:
-            observed_library_ids = _library_ids_from_ads(ads)
+            observed_library_ids = set(_library_ids_from_ads(ads))
+            visible_existing_representative_ids = [
+                library_id
+                for library_id in _library_ids_from_ads(main_ads)
+                if library_id in existing_competitor_library_ids
+            ]
+            inferred_existing_library_ids: set[str] = set()
             with psycopg.connect(self.database_url) as conn:
-                existing_library_ids = _existing_library_ids(conn, observed_library_ids)
-                existing_usernames = _existing_influencer_instagram_usernames(conn, observed_library_ids)
+                existing_library_ids = _existing_library_ids(conn, list(observed_library_ids))
+                existing_usernames = _existing_influencer_instagram_usernames(conn, list(observed_library_ids))
+                if visible_existing_representative_ids:
+                    same_source_by_leader = _same_source_library_ids_by_leader(
+                        conn,
+                        visible_existing_representative_ids,
+                    )
+                    for leader_id in visible_existing_representative_ids:
+                        inferred_existing_library_ids.update(
+                            same_source_by_leader.get(leader_id, [leader_id])
+                        )
+            inferred_existing_library_ids.difference_update(observed_library_ids)
+            observed_library_ids.update(inferred_existing_library_ids)
             existing_ads, new_ads = _split_ads_by_existing(ads, existing_library_ids)
             fallback_ads = _fallback_target_ads(new_ads, existing_ads, existing_usernames)
             fallback_matches = _fill_new_ad_influencer_instagram_usernames(fallback_ads)
@@ -191,7 +232,12 @@ class AdFungusSpider(Spider):
                 )
             prepared_new_ads = _prepare_media_for_storage(new_ads)
             LOGGER.info(
-                f"crawl split competitor_id={competitor_id} observed={len(observed_library_ids)} existing={len(existing_ads)} new={len(prepared_new_ads)}"
+                "crawl split competitor_id=%s observed=%s inferred_existing=%s existing=%s new=%s",
+                competitor_id,
+                len(observed_library_ids),
+                len(inferred_existing_library_ids),
+                len(existing_ads),
+                len(prepared_new_ads),
             )
         except Exception as exc:
             LOGGER.exception(f"crawl prep failed for competitor_id={competitor_id}")
@@ -211,6 +257,13 @@ class AdFungusSpider(Spider):
                     competitor_id=competitor_id,
                     ads=existing_ads,
                 )
+                inferred_stored, _ = _store_inferred_existing_observations(
+                    conn,
+                    run_id=run_id,
+                    workspace_id=workspace_id,
+                    competitor_id=competitor_id,
+                    library_ids=sorted(inferred_existing_library_ids),
+                )
                 new_stored, new_library_ids = _store_ads(
                     conn,
                     run_id=run_id,
@@ -219,18 +272,23 @@ class AdFungusSpider(Spider):
                     competitor_id=competitor_id,
                     ads=prepared_new_ads,
                 )
-                stored = existing_stored + new_stored
+                stored = existing_stored + inferred_stored + new_stored
                 _mark_missing_ads(
                     conn,
                     workspace_id=workspace_id,
                     competitor_id=competitor_id,
                     page_id=page_id,
-                    observed_library_ids=observed_library_ids,
+                    observed_library_ids=sorted(observed_library_ids),
                 )
                 _finish_run(conn, run_id, status="success", ad_count=stored)
                 conn.commit()
                 LOGGER.info(
-                    f"stored {stored} observed ads for competitor_id={competitor_id} run_id={run_id} new={len(new_library_ids)}"
+                    "stored %s observed ads for competitor_id=%s run_id=%s new=%s inferred_existing=%s",
+                    stored,
+                    competitor_id,
+                    run_id,
+                    len(new_library_ids),
+                    len(inferred_existing_library_ids),
                 )
             except Exception as exc:
                 conn.rollback()

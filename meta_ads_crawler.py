@@ -724,7 +724,6 @@ def _build_blocked_domains_page_setup() -> Optional[Callable[[Any], Awaitable[No
                 request = getattr(route, "request", None)
                 request_url = str(getattr(request, "url", "") or "")
                 hostname = str(urlparse(request_url).hostname or "").strip().lower()
-                LOGGER.info('route-seen hostname="%s" url="%s"', hostname, request_url)
                 if _should_abort_media_request(hostname):
                     LOGGER.debug(
                         'Custom page.route blocking request hostname="%s" url="%s"',
@@ -1809,14 +1808,24 @@ async def _collect_summary_popup_groups(
     debug: bool,
     limit: int,
     wait_ms: int,
+    skip_library_ids: Optional[set[str]] = None,
 ) -> List[List[Dict[str, Any]]]:
     groups: List[List[Dict[str, Any]]] = []
     seen_group_keys = set()
     summary_texts = ["See summary details", "요약 세부 사항 보기"]
     marked_ids = await _mark_top_ad_cards(page, limit=limit, debug=debug)
+    skip_ids = {str(value) for value in (skip_library_ids or set()) if value}
     clicked = 0
 
     for card_index, library_id in enumerate(marked_ids):
+        if library_id in skip_ids:
+            if debug:
+                LOGGER.debug(
+                    "summary_popup_skipped_existing_representative card_index=%s library_id=%s",
+                    card_index,
+                    library_id,
+                )
+            continue
         card = page.locator(f'[data-meta-ad-crawl-index="{card_index}"]')
         button = None
         matched_text = ""

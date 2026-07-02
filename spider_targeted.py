@@ -22,6 +22,7 @@ from cron_runner_old import (
     _ensure_default_workspace,
     _load_local_env,
     _expand_versions_globally,
+    _existing_workspace_library_ids,
 )
 from meta_ads_crawler import (
     build_ads_library_search_url,
@@ -35,7 +36,7 @@ from meta_ads_crawler import (
 
 LOGGER = logging.getLogger("spider-targeted")
 
-DEFAULT_TARGET_IDS = [14, 31, 79, 80, 82, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 97, 98, 102, 103]
+DEFAULT_TARGET_IDS = [103, 104, 107, 108, 109] # [14, 31, 79, 80, 82, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 97, 98, 102, 103, 104, 107, 108, 109]
 
 
 def _target_ids_from_env() -> list[int]:
@@ -90,6 +91,12 @@ class TargetedAdFungusSpider(AdFungusSpider):
             page_id = comp.get("page_id")
             competitor_id = comp["id"]
             workspace_id = comp["workspace_id"]
+            with psycopg.connect(self.database_url) as conn:
+                existing_competitor_library_ids = _existing_workspace_library_ids(
+                    conn,
+                    workspace_id=workspace_id,
+                    competitor_id=competitor_id,
+                )
 
             target_url = (
                 build_ads_library_search_url(brand)
@@ -103,6 +110,7 @@ class TargetedAdFungusSpider(AdFungusSpider):
                 scroll_wait_ms_val,
                 stable_rounds_val,
                 debug_val,
+                skip_library_ids,
             ):
                 popup_groups = []
 
@@ -141,6 +149,7 @@ class TargetedAdFungusSpider(AdFungusSpider):
                             debug=debug_val,
                             limit=limit_val,
                             wait_ms=scroll_wait_ms_val,
+                            skip_library_ids=skip_library_ids,
                         )
                     )
                     await page.wait_for_timeout(1500)
@@ -153,6 +162,7 @@ class TargetedAdFungusSpider(AdFungusSpider):
                 self.scroll_wait_ms,
                 self.stable_rounds,
                 self.debug,
+                existing_competitor_library_ids,
             )
 
             LOGGER.info(f"[*] Queuing request for {brand} (ID: {competitor_id})")
@@ -178,6 +188,7 @@ class TargetedAdFungusSpider(AdFungusSpider):
                     "workspace_id": workspace_id,
                     "run_id": run_id,
                     "popup_groups": popup_groups,
+                    "existing_competitor_library_ids": sorted(existing_competitor_library_ids),
                 },
                 page_action=page_action,
                 timeout=120000,
@@ -224,7 +235,7 @@ def main(argv: list[str] | None = None):
         target_ids=target_ids,
     )
     LOGGER.info("targeted spider job_id=%s", job_id)
-    spider.start(concurrency=1, engine="stealthy")
+    spider.start(concurrency=4, engine="stealthy")
 
     elapsed = time.perf_counter() - start_time
     LOGGER.info(f"--- Spider Crawl Finished in {elapsed:.2f} seconds ---")
